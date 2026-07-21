@@ -1,92 +1,367 @@
-# Obsidian Sample Plugin
+<div align="center">
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+# 智学助手
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+**Obsidian AI 学习助手 — 让你专注于学习，而非整理**
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
+[![GitHub release](https://img.shields.io/github/v/release/xxinjie21/question-generator?style=flat-square&sort=semver)](https://github.com/xxinjie21/question-generator/releases)
+[![GitHub license](https://img.shields.io/github/license/xxinjie21/question-generator?style=flat-square)](LICENSE)
+[![Obsidian](https://img.shields.io/badge/Obsidian-1.4.0+-483699?style=flat-square&logo=obsidian)](https://obsidian.md)
 
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and outputs a Notice on click.
-- Registers a global interval which logs 'setInterval' to the console.
+[功能特性](#-功能特性) · [安装](#-安装) · [快速上手](#-快速上手) · [功能详解](#-功能详解) · [配置](#-配置) · [开发](#-开发指南) · [常见问题](#-常见问题)
 
-## First time developing plugins?
+</div>
 
-Quick starting guide for new plugin devs:
+---
 
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `src/main.ts` to `main.js`.
-- Make changes to `src/main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
+## 简介
 
-## Releasing new releases
+智学助手是一个 Obsidian 插件，它读取你本地的 Markdown 知识库，调用 Ollama 或 OpenAI 兼容 API 自动生成试题，并提供完整的答题、错题管理和复习系统。
 
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
+**核心理念：不浪费你的每一秒，让你专注于学习本身。**
 
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
+- 从知识库到试卷，一键完成
+- 答完即批，错题自动归档
+- AI 识别任意文档中的试题
+- 考研专业课排版格式导出
 
-## Adding your plugin to the community plugin list
+---
 
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
+## 功能特性
 
-## How to use
+### 🧠 AI 智能出题
+- 支持 **单选、多选、判断、填空、简答** 5 种题型，可自由开关
+- 多文件批量选择，按知识点分组或按时间排序
+- AI 自动提取知识点标签，生成后自动归类到 Obsidian 知识图谱
+- 兼容 **Ollama**（本地模型）和 **OpenAI**（GPT-4、Claude 等）
 
-- Clone this repo.
-- Make sure your NodeJS is at least v18 (`node --version`).
-- `npm i` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
+### 📄 试卷识别
+- 从任意 Markdown 文档中用 AI 提取试题
+- 自动识别原文题型（论述题、计算题等），保持原格式
+- 试卷给出的答案保留，未给答案 AI 自动生成
+- 批量识别多个文件，结果自动保存到指定文件夹
 
-## Manually installing the plugin
+### ✏️ 答题模式
+- 选择已有试卷或生成的题目，立即开始答题
+- 单选/多选/判断/填空/简答全题型支持
+- 即时评分，显示对错和解析
+- 手动将错题加入错题本，支持自定义标签和备注
 
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
+### 📚 错题本
+- **SM-2 间隔重复算法**，智能安排复习计划
+- 按知识点、源文件、日期分组查看
+- 自动提取知识点标签，生成知识薄弱点报告
+- 一键跳转到源文件查看原始笔记
+- 错题笔记自动生成 `[[wikilinks]]`，融入 Obsidian 知识图谱
 
-## Improve code quality with eslint
+### 📊 学习分析
+- 统计总题数、正确率、掌握率
+- 识别 **知识薄弱点**，展示具体错题
+- 生成学习趋势图（近期正确率变化）
+- 自动创建知识点 MOC 索引笔记
 
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code.
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
+### 📤 专业排版导出
+- **考研专业课参考答案格式**排版
+- 支持 **Word (.docx)**、**PDF**、**Markdown** 三种格式
+- 技术术语自动加红色波浪下划线
+- 答案汇总页自动剔除（无答案版导出）
+- 多步骤答案自动编号为 `1. 2. 3.` 格式
 
-## Funding URL
+### 🔗 知识图谱集成
+- 自动生成 `[[wikilinks]]` 关联知识点
+- 使用 Obsidian 原生 `tags` 标签系统
+- 知识点 MOC 索引笔记自动维护
+- 所有错题笔记都可被 Obsidian 图谱识别
 
-You can include funding URLs where people who use your plugin can financially support it.
+---
 
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
+## 安装
 
-```json
-{
-	"fundingUrl": "https://buymeacoffee.com"
-}
+### 方式一：社区插件（推荐）
+
+1. 打开 **Obsidian → 设置 → 社区插件**
+2. 关闭 **安全模式**（如已开启）
+3. 点击 **浏览**，搜索 **"智学助手"**
+4. 点击 **安装**，然后 **启用**
+
+### 方式二：手动安装
+
+1. 从 [Releases](https://github.com/xxinjie21/question-generator/releases) 下载最新版本
+2. 解压后将以下 3 个文件复制到你的 Vault 目录：
+   ```
+   你的Vault/.obsidian/plugins/question-generator/
+   ├── main.js
+   ├── manifest.json
+   └── styles.css
+   ```
+3. 重启 Obsidian
+4. 在 **设置 → 社区插件** 中启用 **智学助手**
+
+---
+
+## 快速上手
+
+### 第 1 步：配置 AI 接口
+
+1. 打开 **设置 → 智学助手**
+2. 选择 API 类型：
+   - **Ollama**（本地部署）：确保 Ollama 已启动，默认地址 `http://127.0.0.1:11434`
+   - **OpenAI**：填入 API Key 和接口地址
+3. 选择模型（如 `qwen2:7b`、`gpt-4o` 等）
+
+### 第 2 步：选择文件并出题
+
+1. 点击左侧边栏的 📚 图标，打开智学助手侧边栏
+2. 点击 **选择文件出题**，在文件树中勾选要出题的 Markdown 文件
+3. 选择题型和数量，点击 **开始生成**
+
+### 第 3 步：答题和复习
+
+1. 生成完成后，点击 **开始答题** 进入答题模式
+2. 完成答题后查看评分，将错题加入错题本
+3. 每次打开 Obsidian 会自动提醒待复习的错题
+
+---
+
+## 功能详解
+
+### AI 出题
+
+选择 Vault 中的 Markdown 文件，AI 会基于文件内容生成试题。
+
+- 支持多文件同时选择，文件按知识点分组显示
+- 可按文件名、知识点、修改时间排序
+- 生成结果自动保存为带 frontmatter 的 Markdown 文件
+- AI 自动提取 3-8 个知识点标签
+
+**右键菜单**：在文件或文件夹上右键，可直接选择 "基于本文档生成试题" 或 "选择文件出题"。
+
+**命令面板**：按 `Ctrl+P`，输入 "基于当前文档" 即可对当前打开的文档出题。
+
+### 已有试卷识别
+
+如果你有现成的试卷文档（不一定是标准 Markdown 格式），可以用 AI 识别其中的题目：
+
+1. 在侧边栏点击 **已有试卷**
+2. 在文件树中勾选要识别的文档
+3. 点击 **AI 识别题目**
+4. AI 会自动识别题型和答案，生成标准格式的试题文件
+
+**适用场景**：
+- 拍照转文字的试卷
+- 从 Word/PDF 复制来的题目
+- 教材、笔记中散布的考点
+
+### 答题模式
+
+答题模式支持所有 5 种题型：
+
+| 题型 | 答题方式 | 评分方式 |
+|------|---------|---------|
+| 单选题 | 点击选项 | 自动 |
+| 多选题 | 点击多个选项 | 自动 |
+| 判断题 | 点击对/错 | 自动 |
+| 填空题 | 输入答案 | 自动 |
+| 简答题 | 输入/粘贴答案 | 手动评分 |
+
+答题完成后，可以手动将错题加入错题本，添加自定义标签和备注。
+
+### 错题本
+
+错题本使用 **SM-2 间隔重复算法**：
+
+- **答对**：间隔时间延长（3天 → 7天 → 14天...）
+- **答错**：间隔重置为 1 天
+- **待复习**：每次打开 Obsidian 自动提醒
+
+错题笔记自动生成：
+- `tags: [错题, 知识点1, 知识点2]`（frontmatter）
+- `source: [[源文件名]]`（frontmatter，可跳转到源文件）
+- `**知识点：** [[知识点1]] [[知识点2]]`（正文，可被 Obsidian 图谱识别）
+
+点击 **查看知识点索引** 可在 `错题本/知识点/` 目录下生成或更新 MOC 笔记。
+
+### 学习分析
+
+- **总览统计**：总题数、正确率、掌握率、待复习数
+- **知识薄弱点**：展示错误次数最多的知识点，展开查看具体错题
+- **学习趋势**：近期正确率变化图
+- **知识点索引**：一键重建 MOC 索引笔记
+
+### 导出
+
+导出支持三种格式，均采用 **考研专业课参考答案排版格式**：
+
+- **Word (.docx)**：标题 + 一级标题题型 + 二级标题题号 + 正文 + 技术术语红色波浪下划线
+- **PDF**：保持 Word 排版格式，支持直接打印
+- **Markdown**：带 frontmatter 的标准格式
+- **无答案版**：自动剔除答案汇总部分，适合自测
+
+---
+
+## 命令面板
+
+按 `Ctrl+P` 打开命令面板，可用的命令：
+
+| 命令 | 说明 |
+|------|------|
+| 打开智学助手侧边栏 | 打开主界面 |
+| 基于当前文档生成试题 | 对当前打开的文档出题 |
+| 查看错题本 | 打开错题本 |
+| 查看出题历史记录 | 查看历史生成记录 |
+| 重建知识点索引 | 重新生成知识点 MOC 笔记 |
+
+---
+
+## 键盘快捷键
+
+| 快捷键 | 功能 |
+|--------|------|
+| `Ctrl+Q` | 快速出题（基于当前文档） |
+| `Ctrl+W` | 打开错题本 |
+
+可在 **设置 → 核心插件 → 快捷键** 中自定义。
+
+---
+
+## 配置
+
+打开 **设置 → 智学助手** 进行配置：
+
+### AI 接口
+
+| 设置项 | 说明 | 默认值 |
+|--------|------|--------|
+| API 类型 | `Ollama` 或 `OpenAI` | `Ollama` |
+| 接口地址 | API 服务地址 | `http://127.0.0.1:11434` |
+| 模型名称 | 使用的模型 | `qwen2:7b` |
+| API Key | OpenAI 的密钥 | 空 |
+| 温度 | 生成随机性（0-1） | `0.1` |
+
+### 出题参数
+
+| 设置项 | 说明 | 默认值 |
+|--------|------|--------|
+| 单选题数量 | 生成的单选题数 | `5` |
+| 多选题数量 | 生成的多选题数 | `3` |
+| 判断题数量 | 生成的判断题数 | `5` |
+| 填空题数量 | 生成的填空题数 | `2` |
+| 简答题数量 | 生成的简答题数 | `2` |
+| 启用题型 | 上次使用的题型组合 | 全部启用 |
+
+### 文件路径
+
+| 设置项 | 说明 | 默认值 |
+|--------|------|--------|
+| 出题文件夹 | 生成试题的保存位置 | `出题` |
+| 错题本文件夹 | 错题笔记的保存位置 | `错题本` |
+| 识别试卷文件夹 | 试卷识别结果的保存位置 | `出题/识别试卷` |
+| 排除文件夹 | 不参与出题的文件夹 | `.obsidian, .trash, 模板, templates` |
+
+### 其他
+
+| 设置项 | 说明 | 默认值 |
+|--------|------|--------|
+| 自动保存 | 生成后自动保存到 Vault | 开启 |
+| 自动复习提醒 | 打开 Obsidian 时提醒待复习错题 | 开启 |
+| 薄弱点阈值 | 错误多少次算薄弱 | `2` |
+
+---
+
+## 技术特点
+
+- **AI 兼容性**：支持所有兼容 Ollama 和 OpenAI API 格式的服务（本地 Ollama、OpenAI、DeepSeek、通义千问等）
+- **SM-2 间隔重复**：基于 SuperMemo 2 算法，科学安排复习计划
+- **自动标签提取**：从文件名和题目内容自动提取知识点标签
+- **知识图谱集成**：通过 `[[wikilinks]]` 和 `tags` 与 Obsidian 原生图谱无缝对接
+- **考研排版格式**：Word/PDF 导出采用专业课参考答案排版标准
+- **CJK 优化**：中文分词和 Token 估算针对中文优化
+- **搜索防抖**：文件搜索输入 250ms 防抖，避免卡顿
+
+---
+
+## 开发指南
+
+### 环境要求
+
+- [Node.js](https://nodejs.org/) >= 18
+- [pnpm](https://pnpm.io/) 或 npm
+
+### 开发
+
+```bash
+# 克隆仓库
+git clone https://github.com/xxinjie21/question-generator.git
+cd question-generator
+
+# 安装依赖
+npm install
+
+# 开发模式（监听文件变化自动编译）
+npm run dev
+
+# 构建生产版本
+npm run build
 ```
 
-If you have multiple URLs, you can also do:
+### 安装到 Obsidian
 
-```json
-{
-	"fundingUrl": {
-		"Buy Me a Coffee": "https://buymeacoffee.com",
-		"GitHub Sponsor": "https://github.com/sponsors",
-		"Patreon": "https://www.patreon.com/"
-	}
-}
+将以下文件复制到你的 Vault 插件目录：
+
+```
+你的Vault/.obsidian/plugins/question-generator/
+├── main.js          # 构建产物
+├── manifest.json    # 插件元数据
+└── styles.css       # 样式文件（如有）
 ```
 
-## API Documentation
+重启 Obsidian 后在 **设置 → 社区插件** 中启用。
 
-See https://docs.obsidian.md
+---
+
+## 常见问题
+
+### Q: 支持哪些 AI 模型？
+支持所有兼容 Ollama 或 OpenAI API 格式的模型。推荐：
+- **本地部署**：Ollama + `qwen2:7b`、`llama3`、`deepseek-coder` 等
+- **云端 API**：OpenAI `gpt-4o`、DeepSeek、通义千问等
+
+### Q: 生成的试题质量如何？
+取决于两个因素：
+1. **源文件质量**：知识库内容越详细，生成的试题越精准
+2. **模型能力**：更大的模型（如 GPT-4o）通常效果更好，7B 小模型也能用
+
+### Q: 试卷识别支持哪些格式？
+支持所有 Markdown 格式的文档。即使是非标准格式（如拍照转文字、从 Word 复制的文本），AI 也能尝试识别其中的题目。
+
+### Q: 错题本的复习计划如何工作？
+使用 SM-2 间隔重复算法：
+- 首次复习：1 天后
+- 答对后：3 天 → 7 天 → 14 天 → 30 天...（逐步延长）
+- 答错后：重置为 1 天
+
+每次打开 Obsidian 时会自动提醒待复习的错题。
+
+### Q: 导出的 Word 文件格式如何？
+采用考研专业课参考答案排版格式：
+- 一级标题：题型（如 "一、单选题"）
+- 二级标题：题号（如 "1."）
+- 技术术语自动加红色波浪下划线
+- 多步骤答案自动编号为 `1. 2. 3.` 格式
+
+### Q: 如何自定义出题 Prompt？
+在 **设置 → 智学助手 → 系统 Prompt** 中可以添加自定义指令，AI 会在生成试题时遵循你的要求。
+
+---
+
+## 许可证
+
+[ISC License](LICENSE)
+
+---
+
+<div align="center">
+
+**如果这个插件对你有帮助，欢迎给个 Star 支持一下！**
+
+</div>
