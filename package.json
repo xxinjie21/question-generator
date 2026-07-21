@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "obsidian-question-generator",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "智学助手 — AI-powered question generator for Obsidian, supports Ollama/OpenAI, SM-2 spaced repetition, and exam-format export",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
