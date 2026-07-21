@@ -1,11 +1,9 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
+	"id": "question-generator",
+	"name": "智学助手",
 	"version": "1.0.0",
-	"minAppVersion": "1.0.0",
-	"description": "Demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
-	"isDesktopOnly": false
+	"minAppVersion": "1.4.0",
+	"description": "读取本地md知识库，调用Ollama/OpenAI兼容API自动生成试题，支持导出MD、Word、PDF，AI识别试卷、错题本、间隔复习",
+	"author": "XXJ",
+	"isDesktopOnly": true
 }
