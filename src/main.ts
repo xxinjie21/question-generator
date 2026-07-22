@@ -520,14 +520,30 @@ export function splitSemantic(text: string): string[] {
 	if (!trimmed) return [];
 	if (trimmed.length <= 60) return [trimmed];
 	const parts: string[] = [];
-	const sentences = trimmed.split(/(?<=[。！？；])\s*/);
+	const sentences: string[] = [];
+	for (const part of trimmed.split(/([。！？；])\s*/)) {
+		if (!part.trim()) continue;
+		if (/[。！？；]/.test(part)) {
+			if (sentences.length > 0) sentences[sentences.length - 1] += part;
+		} else {
+			sentences.push(part);
+		}
+	}
 	for (const s of sentences) {
 		const st = s.trim();
 		if (!st) continue;
 		if (st.length <= 60) {
 			parts.push(st);
 		} else {
-			const subParts = st.split(/(?<=[，、])\s*/);
+			const subParts: string[] = [];
+			for (const part of st.split(/([，、])\s*/)) {
+				if (!part.trim()) continue;
+				if (/[，、]/.test(part)) {
+					if (subParts.length > 0) subParts[subParts.length - 1] += part;
+				} else {
+					subParts.push(part);
+				}
+			}
 			let buf = "";
 			for (const sp of subParts) {
 				const spTrimmed = sp.trim();
