@@ -2,11 +2,14 @@ import { App, Plugin, TFile, TFolder, Notice, ItemView, WorkspaceLeaf, requestUr
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, UnderlineType } from "docx";
 import * as fs from "fs";
 import * as path from "path";
-const { remote } = require("electron");
+import { remote } from "electron";
+
+function getElectronRemote() { return remote; }
 
 // ===================== 类型定义 =====================
 interface OllamaResponse { response?: string; }
-interface OpenAIResponse { choices?: { message?: { content?: string } }[]; }
+
+type FmValue = string | boolean | number | string[];
 
 interface HistoryEntry {
 	id: string;
@@ -82,7 +85,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	systemPrompt: "",
 	questionFolder: "出题",
 	wrongBookFolder: "错题本",
-	excludeFolders: ".obsidian, .trash, 模板, templates",
+	excludeFolders: ".trash, 模板, templates",
 	autoSave: true,
 	lastTags: "",
 	lastEnabledTypes: "single,multi,judge,blank,essay",
@@ -113,13 +116,13 @@ const RECENT_HISTORY_LIMIT = 10;
 const RECENT_DAYS_LIMIT = 5;
 
 // ===================== 工具函数 =====================
-function parseFM(content: string): { meta: Record<string, any>; body: string } {
+export function parseFM(content: string): { meta: Record<string, FmValue>; body: string } {
 	if (!content.startsWith("---")) return { meta: {}, body: content };
 	const end = content.indexOf("---", 3);
 	if (end === -1) return { meta: {}, body: content };
 	const yaml = content.slice(3, end).trim();
 	const body = content.slice(end + 3).trim();
-	const meta: Record<string, any> = {};
+	const meta: Record<string, FmValue> = {};
 	for (const line of yaml.split("\n")) {
 		const i = line.indexOf(":");
 		if (i === -1) continue;
@@ -134,17 +137,18 @@ function parseFM(content: string): { meta: Record<string, any>; body: string } {
 	return { meta, body };
 }
 
-function buildFM(data: Record<string, any>): string {
+export function buildFM(data: Record<string, FmValue>): string {
 	let y = "---\n";
 	for (const [k, v] of Object.entries(data)) {
 		if (Array.isArray(v)) y += `${k}: [${v.join(", ")}]\n`;
 		else if (typeof v === "boolean") y += `${k}: ${v}\n`;
+		else if (typeof v === "number") y += `${k}: ${v}\n`;
 		else y += `${k}: "${String(v).replace(/"/g, '\\"')}"\n`;
 	}
 	return y + "---\n\n";
 }
 
-function knowledgeTags(tags: string[]): string[] {
+export function knowledgeTags(tags: string[]): string[] {
 	return tags.filter(t => !SYSTEM_TAGS.includes(t));
 }
 
@@ -160,17 +164,17 @@ const CN_STOP = new Set(["的", "了", "在", "是", "我", "有", "和", "就",
 
 function debounce<T extends (...args: any[]) => void>(fn: T, ms: number): T {
 	let timer: number | null = null;
-	return ((...args: any[]) => {
+	return ((...args: Parameters<T>) => {
 		if (timer !== null) window.clearTimeout(timer);
 		timer = window.setTimeout(() => fn(...args), ms);
-	}) as unknown as T;
+	}) as T;
 }
 
 function extractKnowledgeTags(sourceName: string, questionText: string): string[] {
 	const tagCount = new Map<string, number>();
 
 	const nameClean = sourceName.replace(/\[\[|\]\]/g, "").replace(/_错题_\d{4}-\d{2}-\d{2}.*$/, "").replace(/_试题_\d{4}-\d{2}-\d{2}.*$/, "").replace(/\.md$/, "");
-	const segments = nameClean.split(/[_\-\s·\/\\]+/).filter(s => s.length >= 2);
+	const segments = nameClean.split(/[_\-\s·/\\]+/).filter(s => s.length >= 2);
 	const CH_NUM = /^(第[一二三四五六七八九十百千\d]+[章节篇讲部]|[一二三四五六七八九十]+[、.])$/;
 	const GENERIC = /^(概述|简介|总结|复习|练习|测试|模拟|真题|期[中末]|考[试查]|作业|课[堂程]|笔记|大纲|目录|附录|参考文献|前言|绪论|引言|摘要|附[录表]|appendix|introduction|summary|overview|review|practice|test|exam|homework|quiz|final|midterm|lecture|course|note|outline|index|appendix|reference|abstract|preface|foreword|body|content|chapter|section|part|volume|book|text|read|material|resource|document|file|doc|txt|pdf|docx|ppt|pptx|xls|xlsx|csv|zip|rar|7z|tar|gz)$/i;
 	for (const seg of segments) {
@@ -246,12 +250,12 @@ async function ensureFolder(app: App, folderPath: string) {
 	}
 }
 
-function safeName(name: string): string {
+export function safeName(name: string): string {
 	return name.replace(/[\\/:*?"<>|]/g, "_").replace(/\.md$/, "");
 }
 
 // ===================== 文本清洗 =====================
-function cleanSourceText(text: string): string {
+export function cleanSourceText(text: string): string {
 	let clean = text;
 	clean = clean.replace(/```[\s\S]*?```/g, "[代码块已省略]");
 	clean = clean.replace(/`[^`\n]+`/g, "");
@@ -273,7 +277,7 @@ function cleanSourceText(text: string): string {
 	return clean.trim();
 }
 
-function estimateTokens(text: string): number {
+export function estimateTokens(text: string): number {
 	let count = 0;
 	for (let i = 0; i < text.length; i++) {
 		const code = text.charCodeAt(i);
@@ -282,7 +286,7 @@ function estimateTokens(text: string): number {
 	return Math.ceil(count);
 }
 
-function stripAnswersForExport(text: string): string {
+export function stripAnswersForExport(text: string): string {
 	const lines = text.split("\n");
 	const result: string[] = [];
 	let skip = false;
@@ -305,7 +309,7 @@ function stripAnswersForExport(text: string): string {
 }
 
 // ===================== 间隔重复 (SM-2) =====================
-function sm2Update(easeFactor: number, interval: number, quality: number): { easeFactor: number; interval: number; nextReview: string } {
+export function sm2Update(easeFactor: number, interval: number, quality: number): { easeFactor: number; interval: number; nextReview: string } {
 	// quality: 0=again, 1=hard, 2=good, 3=easy
 	let newEF = easeFactor + (0.1 - (3 - quality) * (0.08 + (3 - quality) * 0.02));
 	if (newEF < 1.3) newEF = 1.3;
@@ -334,18 +338,18 @@ function sm2Update(easeFactor: number, interval: number, quality: number): { eas
 	};
 }
 
-function todayStr(): string {
+export function todayStr(): string {
 	return new Date().toISOString().slice(0, 10);
 }
 
-function isDueForReview(note: WrongAnswerNote): boolean {
+export function isDueForReview(note: WrongAnswerNote): boolean {
 	if (note.mastered) return false;
 	if (!note.nextReview) return false;
 	return note.nextReview <= todayStr();
 }
 
 // ===================== 题目解析器 =====================
-function stripMd(text: string): string {
+export function stripMd(text: string): string {
 	return text
 		.replace(/\*\*([^*]+)\*\*/g, "$1")
 		.replace(/\*([^*]+)\*/g, "$1")
@@ -357,7 +361,7 @@ function stripMd(text: string): string {
 		.trim();
 }
 
-function parseQuestions(text: string): ParsedQuestion[] {
+export function parseQuestions(text: string): ParsedQuestion[] {
 	const cleaned = stripMd(text);
 	const questions: ParsedQuestion[] = [];
 
@@ -498,7 +502,7 @@ function buildFileTree(files: TFile[]): TreeNode {
 }
 
 // ===================== 排版工具 =====================
-function stripAnswerSummarySection(text: string): string {
+export function stripAnswerSummarySection(text: string): string {
 	return text.replace(/\n*#{0,3}\s*答案汇总\s*\n[\s\S]*$/, "").trim();
 }
 
@@ -510,7 +514,7 @@ const ExplainColor = "1565C0";
 
 const TECH_TERMS = /\b(GPT|API|REST|HTTP|HTTPS|JSON|XML|SQL|CSS|HTML|JavaScript|TypeScript|Python|Java|React|Vue|Angular|Node\.js|Docker|Kubernetes|Git|Linux|Windows|macOS|SDK|IDE|CLI|JWT|OAuth|TCP|UDP|IP|DNS|URL|URI|SSH|FTP|SMTP|WebSocket|GraphQL|gRPC|MQTT|NoSQL|ORM|CRUD|MVC|MVP|MVVM|CI\/CD|DevOps|SaaS|PaaS|IaaS|FaaS|AWS|Azure|GCP|LLM|NLP|AI|ML|DL|CNN|RNN|LSTM|BERT|Transformer|CUDA|GPU|CPU|RAM|ROM|SSD|HDD|LAN|WAN|VPN|CDN|CORS|XSS|CSRF|SQL注入|JWT|RBAC|ABAC|HAL|HATEOAS|WebSocket|Server-Sent Events|Event Loop|Callback|Promise|Async\/Await|Closure|Prototype|Decorator|Middleware|Plugin|Hook|State|Props|Virtual DOM|DOM|BOM|SPA|SSR|SSG|ISR|CSR|PWA|MVC|ORM|DI|IoC|AOP|TDD|BDD|DDD)\b/gi;
 
-function splitSemantic(text: string): string[] {
+export function splitSemantic(text: string): string[] {
 	const trimmed = text.trim();
 	if (!trimmed) return [];
 	if (trimmed.length <= 60) return [trimmed];
@@ -547,7 +551,7 @@ function splitSemantic(text: string): string[] {
 
 const STEP_TEXT_MAP: Record<string, number> = { "第一": 1, "第二": 2, "第三": 3, "第四": 4, "第五": 5, "第六": 6, "第七": 7, "第八": 8, "第九": 9, "第十": 10, "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20 };
 
-function normalizeAnswerSteps(text: string): string {
+export function normalizeAnswerSteps(text: string): string {
 	return text.replace(/(第[一二三四五六七八九十]+)[步点个方面]([：:：]?)\s*/g, (_m, step: string, colon: string) => {
 		const num = STEP_TEXT_MAP[step];
 		if (!num) return _m;
@@ -567,7 +571,7 @@ function splitAnswerPoints(raw: string): string[] {
 	return result.length > 0 ? result : [trimmed];
 }
 
-function splitAnswerContent(raw: string): string[] {
+export function splitAnswerContent(raw: string): string[] {
 	const trimmed = normalizeAnswerSteps(raw.trim());
 	if (!trimmed) return [];
 	if (/\d+[.、）)]/.test(trimmed)) {
@@ -619,7 +623,7 @@ function highlightTechHtml(text: string): string {
 	return text.replace(TECH_TERMS, '<span style="text-decoration:underline wavy red;">$&</span>');
 }
 
-function htmlEscape(s: string): string {
+export function htmlEscape(s: string): string {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
@@ -683,9 +687,9 @@ function normalizeExamContent(text: string): string {
 	return result.join("\n");
 }
 
-function pushPara(children: Paragraph[], opts: { runs?: TextRun[]; spacing?: any; indent?: any; alignment?: any; heading?: any }) {
+function pushPara(children: Paragraph[], opts: { runs?: TextRun[]; spacing?: { before?: number; after?: number; line?: number }; indent?: { left?: number; right?: number }; alignment?: (typeof AlignmentType)[keyof typeof AlignmentType]; heading?: (typeof HeadingLevel)[keyof typeof HeadingLevel] }) {
 	if (opts.runs) {
-		children.push(new Paragraph({ children: opts.runs, spacing: opts.spacing || { before: 0, after: 0 }, indent: opts.indent, alignment: opts.alignment }));
+		children.push(new Paragraph({ children: opts.runs, spacing: opts.spacing || { before: 0, after: 0 }, indent: opts.indent as any, alignment: opts.alignment, heading: opts.heading }));
 	}
 }
 
@@ -934,7 +938,7 @@ function buildExportHtml(text: string, title?: string, source?: string): string 
 async function exportPdfDirect(filePath: string, text: string, title?: string, source?: string) {
 	const fullHtml = buildExportHtml(text, title, source);
 	
-	const { BrowserWindow } = remote;
+	const { BrowserWindow } = getElectronRemote();
 	const win = new BrowserWindow({ show: false, width: 900, height: 1200, webPreferences: { offscreen: true } });
 	await win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(fullHtml));
 	const pdfData = await win.webContents.printToPDF({ printBackground: true, pageSize: "A4", marginTop: 0.6, marginBottom: 0.6, marginLeft: 0.5, marginRight: 0.5 });
@@ -1200,7 +1204,7 @@ class MainSidebarView extends ItemView {
 				const clean = content.replace(/^---[\s\S]*?---\s*/, "");
 				const baseName = file.basename.replace(/_试题.*$/, "");
 				
-				const r = await remote.dialog.showSaveDialog({ defaultPath: file.basename + ".docx", filters: [{ name: "Word", extensions: ["docx"] }, { name: "PDF", extensions: ["pdf"] }, { name: "Markdown", extensions: ["md"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: file.basename + ".docx", filters: [{ name: "Word", extensions: ["docx"] }, { name: "PDF", extensions: ["pdf"] }, { name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
 				const fp = r.filePath;
 				if (fp.endsWith(".docx")) {
@@ -1576,13 +1580,13 @@ class MainSidebarView extends ItemView {
 			const dateStr = note.date || new Date().toISOString().slice(0, 10);
 			const srcName = note.sourceFile?.replace(/\[\[|\]\]/g, "") || "";
 			if (format === "md") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: note.baseName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
 				const mdContent = "# " + note.baseName + "\n\n> 来源：" + (srcName || "未知") + "　|　日期：" + dateStr + "\n\n" + stripAnswerSummarySection(note.resultText);
 				fs.writeFileSync(r.filePath, mdContent, "utf-8");
 				new Notice("MD文件已保存");
 			} else if (format === "word") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: note.baseName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
 				if (r.canceled || !r.filePath) return;
 				const children = buildWordParagraphs(note.resultText, note.baseName, srcName + " " + dateStr);
 				const doc = new Document({ sections: [{ properties: {}, children }] });
@@ -1590,7 +1594,7 @@ class MainSidebarView extends ItemView {
 				fs.writeFileSync(r.filePath, Buffer.from(buffer));
 				new Notice("Word文件已保存");
 			} else if (format === "pdf") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: note.baseName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
 				if (r.canceled || !r.filePath) return;
 				await exportPdfDirect(r.filePath, note.resultText, note.baseName, srcName + " " + dateStr);
 				new Notice("PDF文件已保存");
@@ -1909,7 +1913,7 @@ class MainSidebarView extends ItemView {
 		backBtn.addEventListener("click", () => { this.homeView = "default"; this.renderHomeTab(); });
 		el.createEl("div", { text: "选择出题文档", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:8px;" } });
 
-		const excludeList = this.plugin.settings.excludeFolders.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+		const excludeList = this.buildExcludeList();
 		this.fpAllFiles = this.app.vault.getFiles().filter(f => {
 			if (f.extension !== "md") return false;
 			const lowerPath = f.path.toLowerCase();
@@ -2129,8 +2133,15 @@ class MainSidebarView extends ItemView {
 		return files;
 	}
 
+	buildExcludeList(): string[] {
+		const list = this.plugin.settings.excludeFolders.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+		const configDir = this.app.vault.configDir;
+		if (configDir && !list.includes(configDir.toLowerCase())) list.push(configDir.toLowerCase());
+		return list;
+	}
+
 	loadExamFiles() {
-		const excludeList = this.plugin.settings.excludeFolders.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+		const excludeList = this.buildExcludeList();
 		this.examFiles = this.app.vault.getFiles().filter(f => {
 			if (f.extension !== "md") return false;
 			const lowerPath = f.path.toLowerCase();
@@ -2648,7 +2659,7 @@ ${cleanSource}
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 			
-			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
+			const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
 			fs.writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + stripAnswerSummarySection(this.genResultText), "utf-8");
@@ -2660,7 +2671,7 @@ ${cleanSource}
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 			
-			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.docx", filters: [{ name: "Word", extensions: ["docx"] }] });
+			const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.docx", filters: [{ name: "Word", extensions: ["docx"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
 			const children = buildWordParagraphs(this.genResultText, this.genFileName + " 配套试题", this.genFileName + " " + dateStr);
@@ -2675,7 +2686,7 @@ ${cleanSource}
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 			
-			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
+			const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
 			if (r.canceled || !r.filePath) return;
 			await exportPdfDirect(r.filePath, this.genResultText, this.genFileName + " 配套试题", this.genFileName);
 			new Notice("PDF已保存");
@@ -2687,7 +2698,7 @@ ${cleanSource}
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 			const noAnswerText = stripAnswersForExport(this.genResultText);
 			
-			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题_无答案.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
+			const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题_无答案.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
 			fs.writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题（无答案版）\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + noAnswerText, "utf-8");
@@ -3106,7 +3117,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 			ensureFolderAbs(folder);
 			for (const f of listMdFiles(folder)) {
 				const { meta, body } = parseFM(readFileStr(folder + "/" + f));
-				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: meta.date || "", sourceFile: meta.source || "", sourcePath: meta.sourcePath || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: meta.note || "", nextReview: meta.nextReview || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
+				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
 			}
 		} else {
 			const folderFile = this.app.vault.getAbstractFileByPath(folder);
@@ -3114,7 +3125,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				for (const child of folderFile.children) {
 					if (child instanceof TFile && child.extension === "md") {
 						const { meta, body } = parseFM(await this.app.vault.read(child));
-						notes.push({ filePath: child.path, baseName: child.basename, date: meta.date || "", sourceFile: meta.source || "", sourcePath: meta.sourcePath || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: meta.note || "", nextReview: meta.nextReview || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
+						notes.push({ filePath: child.path, baseName: child.basename, date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
 					}
 				}
 			}
@@ -3207,14 +3218,14 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		try {
 			
 			if (format === "md") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: defaultName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
 				const dateStr = new Date().toISOString().slice(0, 10);
 				const mdHeader = title ? "# " + title + "\n\n> 来源：" + (source || title) + "　|　日期：" + dateStr + "\n\n" : "";
 				fs.writeFileSync(r.filePath, mdHeader + stripAnswerSummarySection(text), "utf-8");
 				new Notice("MD文件已保存");
 			} else if (format === "word") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: defaultName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
 				if (r.canceled || !r.filePath) return;
 				const children = buildWordParagraphs(text, title, source);
 				const doc = new Document({ sections: [{ properties: {}, children }] });
@@ -3222,7 +3233,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				fs.writeFileSync(r.filePath, Buffer.from(buffer));
 				new Notice("Word文件已保存");
 			} else if (format === "pdf") {
-				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
+				const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: defaultName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
 				if (r.canceled || !r.filePath) return;
 				await exportPdfDirect(r.filePath, text, title, source);
 				new Notice("PDF文件已保存");
