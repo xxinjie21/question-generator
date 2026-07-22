@@ -1,4 +1,4 @@
-# 智学助手
+# Smart Quiz Tutor
 
 <div align="center">
 
@@ -7,346 +7,134 @@
 ![AI](https://img.shields.io/badge/AI-Ollama%20%7C%20OpenAI-brightgreen.svg?style=flat-square)
 ![License](https://img.shields.io/badge/License-ISC-blue.svg?style=flat-square)
 
-**基于 Obsidian + Ollama/OpenAI 的 AI 智能学习助手插件，从知识库到试卷一键完成**
-
-[功能特性](#-功能特性) • [技术栈](#-技术栈) • [快速开始](#-快速开始) • [功能详解](#-功能详解) • [项目结构](#-项目结构)
+**AI-powered quiz generation for Obsidian — read your Markdown knowledge base, call Ollama/OpenAI-compatible APIs to auto-generate quizzes with answer tracking, wrong answer book, and SM-2 spaced repetition.**
 
 </div>
 
 ---
 
-## 项目介绍
+## Features
 
-本项目是一个 **Obsidian AI 学习助手插件**，读取你本地的 Markdown 知识库，调用 Ollama 或 OpenAI 兼容 API 自动生成试题，并提供完整的答题、错题管理和复习系统。
+### 1. AI Quiz Generation
+- Select Markdown files → AI extracts knowledge points → generates quizzes (5 question types) → auto-saves to vault
+- Supports: **Single Choice, Multiple Choice, True/False, Fill-in-the-Blank, Essay**
+- Batch select multiple files, group by knowledge tag or sort by time
+- AI automatically extracts knowledge tags and integrates with Obsidian knowledge graph
+- Compatible with **Ollama** (local models) and **OpenAI-compatible APIs** (GPT-4, DeepSeek, etc.)
 
-### 核心理念
+### 2. Exam Recognition
+- AI extracts quiz questions from any Markdown document
+- Auto-detects original question types (essay, calculation, etc.) preserving format
+- Retains original answers when available; AI generates answers for missing ones
+- Batch process multiple files with results auto-saved
 
-**不浪费你的每一秒，让你专注于学习本身。**
+### 3. Answer Mode
+- Select existing quizzes or generated questions and start answering immediately
+- Instant scoring with correct/incorrect display and explanations
+- Manually add wrong answers to the wrong answer book with custom tags and notes
 
-- 从知识库到试卷，一键完成
-- 答完即批，错题自动归档
-- AI 识别任意文档中的试题
-- 考研专业课排版格式导出
+### 4. Wrong Answer Book (SM-2 Spaced Repetition)
+- Correct answer: interval extends (1d → 3d → 7d → 14d → 30d...)
+- Wrong answer: interval resets to 1 day
+- Auto-reminder for due reviews on Obsidian startup
+- Group by knowledge point, source file, or date
+- Wrong notes include `[[wikilinks]]` for Obsidian knowledge graph integration
 
----
+### 5. Learning Analytics
+- Statistics: total questions, accuracy rate, mastery rate
+- Identify **weak knowledge points** with specific wrong questions
+- Study trend charts (recent accuracy changes)
+- Auto-creates knowledge point MOC index notes
 
-## 核心特性
-
-### 1. AI 智能出题
-
-```
-选择 Markdown 文件 → AI 提取知识点 → 生成试题（5 种题型） → 自动保存到 Vault
-```
-
-- 支持 **单选、多选、判断、填空、简答** 5 种题型，可自由开关
-- 多文件批量选择，按知识点分组或按时间排序
-- AI 自动提取知识点标签，生成后自动归类到 Obsidian 知识图谱
-- 兼容 **Ollama**（本地模型）和 **OpenAI**（GPT-4、Claude 等）
-
-### 2. 试卷识别
-
-- 从任意 Markdown 文档中用 AI 提取试题
-- 自动识别原文题型（论述题、计算题等），保持原格式
-- 试卷给出的答案保留，未给答案 AI 自动生成
-- 批量识别多个文件，结果自动保存到指定文件夹
-
-### 3. 答题模式
-
-- 选择已有试卷或生成的题目，立即开始答题
-- 即时评分，显示对错和解析
-- 手动将错题加入错题本，支持自定义标签和备注
-
-### 4. 错题本（SM-2 间隔重复）
-
-```
-答对：间隔延长（3天 → 7天 → 14天 → 30天...）
-答错：间隔重置为 1 天
-每次打开 Obsidian 自动提醒待复习错题
-```
-
-- 按知识点、源文件、日期分组查看
-- 自动提取知识点标签，生成知识薄弱点报告
-- 错题笔记自动生成 `[[wikilinks]]`，融入 Obsidian 知识图谱
-
-### 5. 学习分析
-
-- 统计总题数、正确率、掌握率
-- 识别 **知识薄弱点**，展示具体错题
-- 生成学习趋势图（近期正确率变化）
-- 自动创建知识点 MOC 索引笔记
-
-### 6. 专业排版导出
-
-- **考研专业课参考答案格式**排版
-- 支持 **Word (.docx)**、**PDF**、**Markdown** 三种格式
-- 技术术语自动加红色波浪下划线
-- 无答案版导出，适合自测
+### 6. Professional Export
+- **Graduate exam answer format** formatting
+- Export to **Word (.docx)**, **PDF**, and **Markdown**
+- Technical terms highlighted with red wavy underline
+- Answer-free version for self-testing
 
 ---
 
-## 技术栈
+## Quick Start
 
-| 技术 | 版本 | 说明 |
-|------|------|------|
-| Obsidian | 1.4.0+ | 宿主平台 |
-| TypeScript | 5.8 | 开发语言 |
-| esbuild | 0.25 | 构建工具 |
-| docx | 9.7 | Word 文件生成 |
-| marked | 18.0 | Markdown 解析 |
-| file-saver | 2.0 | 文件下载 |
-| Ollama / OpenAI API | - | AI 模型接口 |
+### 1. Prerequisites
+- Node.js >= 18
+- Obsidian v1.4.0+
 
-### 核心依赖
-
-- **docx**：生成 Word (.docx) 文件，支持考研排版格式
-- **marked**：解析 Markdown 文件内容
-- **file-saver**：浏览器端文件下载
-- **SM-2 算法**：基于 SuperMemo 2 的间隔重复算法（自实现）
-
----
-
-## 快速开始
-
-### 1. 环境准备
-
-```bash
-# Node.js >= 18
-node -v
-
-# npm 或 pnpm
-npm -v
-```
-
-### 2. 克隆项目
-
+### 2. Install
 ```bash
 git clone https://github.com/xxinjie21/question-generator.git
 cd question-generator
-```
-
-### 3. 安装依赖并构建
-
-```bash
-# 安装依赖
 npm install
-
-# 开发模式（监听文件变化自动编译）
-npm run dev
-
-# 构建生产版本
 npm run build
 ```
 
-### 4. 安装到 Obsidian
-
-将以下文件复制到你的 Vault 插件目录：
-
+Copy these files to your vault's plugin directory:
 ```
-你的Vault/.obsidian/plugins/question-generator/
-├── main.js          # 构建产物
-├── manifest.json    # 插件元数据
-└── styles.css       # 样式文件
+your-vault/.obsidian/plugins/question-generator/
+├── main.js
+├── manifest.json
+└── styles.css
 ```
 
-重启 Obsidian，在 **设置 → 社区插件** 中启用 **智学助手**。
+### 3. Configure AI
+Open **Settings → Smart Quiz Tutor**:
+- **API Type**: Ollama (local) or OpenAI-compatible
+- **API URL**: Default `http://127.0.0.1:11434` for Ollama
+- **Model**: e.g., `qwen2:7b`, `gpt-4o`
+- **API Key**: Required for OpenAI
 
-### 5. 配置 AI 接口
-
-1. 打开 **设置 → 智学助手**
-2. 选择 API 类型：
-   - **Ollama**（本地部署）：确保 Ollama 已启动，默认地址 `http://127.0.0.1:11434`
-   - **OpenAI**：填入 API Key 和接口地址
-3. 选择模型（如 `qwen2:7b`、`gpt-4o` 等）
-
-### 6. 开始使用
-
-1. 点击左侧边栏的 📚 图标，打开智学助手侧边栏
-2. 点击 **选择文件出题**，勾选要出题的 Markdown 文件
-3. 选择题型和数量，点击 **开始生成**
-4. 生成完成后点击 **开始答题** 进入答题模式
+### 4. Use
+1. Click the 📚 icon in the left ribbon to open the sidebar
+2. Click **Select Files** and choose Markdown files
+3. Select question types and quantities, click **Generate**
+4. Click **Start Answering** to take the quiz
 
 ---
 
-## 功能详解
+## Commands
 
-### AI 出题
+| Command | Description |
+|---------|-------------|
+| Open Smart Quiz Tutor sidebar | Open main interface |
+| Generate questions from current document | Quiz from active file |
+| View wrong answer book | Open wrong book |
+| View generation history | View past quiz records |
+| Rebuild knowledge index | Regenerate MOC notes |
 
-选择 Vault 中的 Markdown 文件，AI 会基于文件内容生成试题。
-
-- 支持多文件同时选择，文件按知识点分组显示
-- 可按文件名、知识点、修改时间排序
-- 生成结果自动保存为带 frontmatter 的 Markdown 文件
-- AI 自动提取 3-8 个知识点标签
-
-**右键菜单**：在文件或文件夹上右键，可直接选择 "基于本文档生成试题" 或 "选择文件出题"。
-
-**命令面板**：按 `Ctrl+P`，输入 "基于当前文档" 即可对当前打开的文档出题。
-
-### 答题模式
-
-| 题型 | 答题方式 | 评分方式 |
-|------|---------|---------|
-| 单选题 | 点击选项 | 自动 |
-| 多选题 | 点击多个选项 | 自动 |
-| 判断题 | 点击对/错 | 自动 |
-| 填空题 | 输入答案 | 自动 |
-| 简答题 | 输入/粘贴答案 | 手动评分 |
-
-### 错题本
-
-错题笔记自动生成：
-- `tags: [错题, 知识点1, 知识点2]`（frontmatter）
-- `source: [[源文件名]]`（frontmatter，可跳转到源文件）
-- `**知识点：** [[知识点1]] [[知识点2]]`（正文，可被 Obsidian 图谱识别）
-
-点击 **查看知识点索引** 可在 `错题本/知识点/` 目录下生成或更新 MOC 笔记。
-
-### 导出
-
-导出支持三种格式，均采用 **考研专业课参考答案排版格式**：
-
-- **Word (.docx)**：标题 + 一级标题题型 + 二级标题题号 + 正文 + 技术术语红色波浪下划线
-- **PDF**：保持 Word 排版格式，支持直接打印
-- **Markdown**：带 frontmatter 的标准格式
-- **无答案版**：自动剔除答案汇总部分，适合自测
+### Hotkeys
+| Hotkey | Function |
+|--------|----------|
+| `Ctrl+Q` | Quick quiz from current document |
+| `Ctrl+W` | Open wrong answer book |
 
 ---
 
-## 命令面板
+## Configuration
 
-按 `Ctrl+P` 打开命令面板，可用的命令：
-
-| 命令 | 说明 |
-|------|------|
-| 打开智学助手侧边栏 | 打开主界面 |
-| 基于当前文档生成试题 | 对当前打开的文档出题 |
-| 查看错题本 | 打开错题本 |
-| 查看出题历史记录 | 查看历史生成记录 |
-| 重建知识点索引 | 重新生成知识点 MOC 笔记 |
-
-### 快捷键
-
-| 快捷键 | 功能 |
-|--------|------|
-| `Ctrl+Q` | 快速出题（基于当前文档） |
-| `Ctrl+W` | 打开错题本 |
-
-可在 **设置 → 核心插件 → 快捷键** 中自定义。
+| Setting | Description | Default |
+|---------|-------------|---------|
+| API Type | Ollama or OpenAI | `Ollama` |
+| API URL | API service address | `http://127.0.0.1:11434` |
+| Model | AI model name | `qwen2:7b` |
+| Temperature | Randomness (0-1) | `0.1` |
+| Question Folder | Save path for generated quizzes | `出题` |
+| Wrong Book Folder | Save path for wrong notes | `错题本` |
+| Excluded Folders | Folders to exclude | `.obsidian, .trash, 模板, templates` |
 
 ---
 
-## 配置项
+## Tech Stack
 
-### AI 接口
-
-| 设置项 | 说明 | 默认值 |
-|--------|------|--------|
-| API 类型 | `Ollama` 或 `OpenAI` | `Ollama` |
-| 接口地址 | API 服务地址 | `http://127.0.0.1:11434` |
-| 模型名称 | 使用的模型 | `qwen2:7b` |
-| API Key | OpenAI 的密钥 | 空 |
-| 温度 | 生成随机性（0-1） | `0.1` |
-
-### 出题参数
-
-| 设置项 | 说明 | 默认值 |
-|--------|------|--------|
-| 单选题数量 | 生成的单选题数 | `5` |
-| 多选题数量 | 生成的多选题数 | `3` |
-| 判断题数量 | 生成的判断题数 | `5` |
-| 填空题数量 | 生成的填空题数 | `2` |
-| 简答题数量 | 生成的简答题数 | `2` |
-| 启用题型 | 上次使用的题型组合 | 全部启用 |
-
-### 文件路径
-
-| 设置项 | 说明 | 默认值 |
-|--------|------|--------|
-| 出题文件夹 | 生成试题的保存位置 | `出题` |
-| 错题本文件夹 | 错题笔记的保存位置 | `错题本` |
-| 识别试卷文件夹 | 试卷识别结果的保存位置 | `出题/识别试卷` |
-| 排除文件夹 | 不参与出题的文件夹 | `.obsidian, .trash, 模板, templates` |
+| Technology | Description |
+|------------|-------------|
+| Obsidian API | Plugin platform |
+| TypeScript | Development language |
+| esbuild | Build tool |
+| docx | Word document generation |
+| SM-2 | Spaced repetition algorithm |
 
 ---
 
-## 项目结构
-
-```
-question-generator/
-├── src/
-│   └── main.ts                    # 插件主入口（全部逻辑）
-├── main.js                        # 构建产物
-├── manifest.json                  # 插件元数据
-├── styles.css                     # 样式文件
-├── package.json                   # 依赖配置
-├── tsconfig.json                  # TypeScript 配置
-├── esbuild.config.mjs             # esbuild 构建配置
-├── version-bump.mjs               # 版本号更新脚本
-├── versions.json                  # Obsidian 版本兼容映射
-├── eslint.config.mts              # ESLint 配置
-├── .editorconfig                  # 编辑器配置
-├── .gitignore                     # Git 忽略规则
-├── LICENSE                        # ISC 许可证
-└── README.md                      # 项目说明
-```
-
----
-
-## 技术特点
-
-| 特点 | 说明 |
-|------|------|
-| **AI 兼容性** | 支持所有兼容 Ollama 和 OpenAI API 格式的服务（本地 Ollama、OpenAI、DeepSeek、通义千问等） |
-| **SM-2 间隔重复** | 基于 SuperMemo 2 算法，科学安排复习计划 |
-| **自动标签提取** | 从文件名和题目内容自动提取知识点标签 |
-| **知识图谱集成** | 通过 `[[wikilinks]]` 和 `tags` 与 Obsidian 原生图谱无缝对接 |
-| **考研排版格式** | Word/PDF 导出采用专业课参考答案排版标准 |
-| **CJK 优化** | 中文分词和 Token 估算针对中文优化 |
-| **搜索防抖** | 文件搜索输入 250ms 防抖，避免卡顿 |
-
----
-
-## 常见问题
-
-### Q: 支持哪些 AI 模型？
-
-支持所有兼容 Ollama 或 OpenAI API 格式的模型。推荐：
-- **本地部署**：Ollama + `qwen2:7b`、`llama3`、`deepseek-coder` 等
-- **云端 API**：OpenAI `gpt-4o`、DeepSeek、通义千问等
-
-### Q: 生成的试题质量如何？
-
-取决于两个因素：
-1. **源文件质量**：知识库内容越详细，生成的试题越精准
-2. **模型能力**：更大的模型（如 GPT-4o）通常效果更好，7B 小模型也能用
-
-### Q: 错题本的复习计划如何工作？
-
-使用 SM-2 间隔重复算法：
-- 首次复习：1 天后
-- 答对后：3 天 → 7 天 → 14 天 → 30 天...（逐步延长）
-- 答错后：重置为 1 天
-
-每次打开 Obsidian 时会自动提醒待复习的错题。
-
-### Q: 导出的 Word 文件格式如何？
-
-采用考研专业课参考答案排版格式：
-- 一级标题：题型（如 "一、单选题"）
-- 二级标题：题号（如 "1."）
-- 技术术语自动加红色波浪下划线
-- 多步骤答案自动编号为 `1. 2. 3.` 格式
-
----
-
-## 许可证
+## License
 
 [ISC License](LICENSE)
-
----
-
-<div align="center">
-
-**如果本项目对你有帮助，请给个 Star 支持！**
-
-</div>

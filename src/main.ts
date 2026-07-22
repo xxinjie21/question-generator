@@ -1,10 +1,11 @@
-import { App, Plugin, TFile, TFolder, Notice, ItemView, WorkspaceLeaf } from "obsidian";
-import { marked } from "marked";
+import { App, Plugin, TFile, TFolder, Notice, ItemView, WorkspaceLeaf, requestUrl } from "obsidian";
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, UnderlineType } from "docx";
+import * as fs from "fs";
+import * as path from "path";
 
 // ===================== 类型定义 =====================
 interface OllamaResponse { response?: string; }
-interface OpenAIChunk { choices?: { delta?: { content?: string } }[]; }
+interface OpenAIResponse { choices?: { message?: { content?: string } }[]; }
 
 interface HistoryEntry {
 	id: string;
@@ -106,7 +107,6 @@ const NOTICE_DURATION_MS = 8000;
 const REVIEW_REMINDER_DELAY_MS = 2000;
 const WRONG_NOTES_CACHE_TTL_MS = 2000;
 const SEARCH_DEBOUNCE_MS = 250;
-const MAX_QUESTION_COUNT = 50;
 const PREVIEW_ITEMS_LIMIT = 3;
 const RECENT_HISTORY_LIMIT = 10;
 const RECENT_DAYS_LIMIT = 5;
@@ -158,10 +158,10 @@ const EN_STOP = new Set(["the", "this", "that", "with", "from", "will", "into", 
 const CN_STOP = new Set(["的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "她", "它", "们", "那", "些", "什么", "为", "所", "以", "及", "或", "等", "之", "把", "被", "让", "给", "对", "从", "由", "但", "而", "且", "如果", "虽然", "因为", "所以", "这个", "那个", "这些", "那些", "如何", "怎样", "哪个", "哪些", "则", "后", "前", "内", "外", "中", "下", "间", "时", "年", "月", "日", "号", "个", "种", "次", "第", "该", "其", "此", "若", "当", "于", "作为", "已", "又", "只", "并", "即", "还", "仍", "却", "才", "非", "无", "未", "莫", "勿", "需", "可", "能", "会", "得", "做", "出", "来", "去", "过", "进", "开", "关", "用", "试", "问", "答", "记", "写", "读", "删", "增", "改", "查", "找", "看", "听", "说", "想", "知", "觉", "感", "受", "让", "叫", "请", "求", "许", "准", "禁", "止", "必", "须", "应", "该", "不", "没", "未", "曾", "已", "正", "在", "将", "要", "想", "愿", "肯", "敢", "能", "可", "许", "准", "予", "给", "与", "向", "往", "朝", "距", "离", "到", "至", "从", "自", "由", "经", "过", "通", "过", "凭", "借", "依", "靠", "按", "照", "据", "根", "据", "依", "照", "遵", "循", "顺", "沿", "随", "同", "跟", "和", "与", "及", "或", "还", "又", "也", "均", "都", "全", "总", "共", "计", "合", "共", "一", "共", "凡", "各", "每", "某", "有", "些", "任", "何", "所", "有", "全", "部", "整", "个", "一", "切", "凡", "是", "但", "凡", "只", "要", "一", "旦", "如", "若", "倘", "如", "假", "使", "既", "然", "虽", "然", "尽", "管", "无", "论", "不", "管", "哪", "怕", "即", "使", "哪", "怕", "再", "也", "不", "如", "果", "不", "然", "要", "不", "然", "否", "则", "或", "者", "还", "是", "不", "是", "有", "没", "有", "能", "不", "能", "可", "不", "可", "行", "不", "行", "对", "不", "对", "好", "不", "好", "是", "不", "是", "做", "不", "做", "用", "不", "用", "要", "不", "要"]);
 
 function debounce<T extends (...args: any[]) => void>(fn: T, ms: number): T {
-	let timer: ReturnType<typeof setTimeout> | null = null;
+	let timer: number | null = null;
 	return ((...args: any[]) => {
-		if (timer !== null) clearTimeout(timer);
-		timer = setTimeout(() => fn(...args), ms);
+		if (timer !== null) window.clearTimeout(timer);
+		timer = window.setTimeout(() => fn(...args), ms);
 	}) as unknown as T;
 }
 
@@ -215,26 +215,23 @@ function isAbs(p: string): boolean {
 }
 
 function ensureFolderAbs(dir: string) {
-	const fs = require("fs");
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
 function writeFileStr(filePath: string, content: string) {
-	require("fs").writeFileSync(filePath, content, "utf-8");
+	fs.writeFileSync(filePath, content, "utf-8");
 }
 
 function readFileStr(filePath: string): string {
-	return require("fs").readFileSync(filePath, "utf-8");
+	return fs.readFileSync(filePath, "utf-8");
 }
 
 function listMdFiles(dir: string): string[] {
-	const fs = require("fs");
 	if (!fs.existsSync(dir)) return [];
 	return fs.readdirSync(dir).filter((f: string) => f.endsWith(".md"));
 }
 
 function deleteFileAbs(filePath: string) {
-	const fs = require("fs");
 	if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 }
 
@@ -940,7 +937,7 @@ async function exportPdfDirect(filePath: string, text: string, title?: string, s
 	const win = new BrowserWindow({ show: false, width: 900, height: 1200, webPreferences: { offscreen: true } });
 	await win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(fullHtml));
 	const pdfData = await win.webContents.printToPDF({ printBackground: true, pageSize: "A4", marginTop: 0.6, marginBottom: 0.6, marginLeft: 0.5, marginRight: 0.5 });
-	require("fs").writeFileSync(filePath, pdfData);
+	fs.writeFileSync(filePath, pdfData);
 	win.close();
 }
 
@@ -985,7 +982,7 @@ class MainSidebarView extends ItemView {
 	answerSourcePath = "";
 	answerCurrentTags: string[] = [];
 	answerStartTime = 0;
-	answerTimerInterval: ReturnType<typeof setInterval> | null = null;
+	answerTimerInterval: ReturnType<typeof window.setInterval> | null = null;
 	answerWrongChecked: Set<number> = new Set();
 
 	// Wrong state
@@ -1012,13 +1009,13 @@ class MainSidebarView extends ItemView {
 	}
 	async onClose() {
 		if (this._refreshHandler) { this.plugin.offDataChanged(this._refreshHandler); this._refreshHandler = null; }
-		if (this.answerTimerInterval) { clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
+		if (this.answerTimerInterval) { window.clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
 		if (this.genAbortController) { this.genAbortController.abort(); this.genAbortController = null; this.genIsGenerating = false; }
 		this.innerContentEl = null;
 	}
 
 	async render() {
-		if (this.answerTimerInterval) { clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
+		if (this.answerTimerInterval) { window.clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
 		const container = this.containerEl.children[1] as HTMLElement;
 		if (!container) return;
 		container.empty();
@@ -1209,13 +1206,13 @@ class MainSidebarView extends ItemView {
 					const children = buildWordParagraphs(clean, baseName + " 配套试题", baseName);
 					const doc = new Document({ sections: [{ properties: {}, children }] });
 					const buffer = await Packer.toBuffer(doc);
-					require("fs").writeFileSync(fp, Buffer.from(buffer));
+					fs.writeFileSync(fp, Buffer.from(buffer));
 					new Notice("Word已保存");
 				} else if (fp.endsWith(".pdf")) {
 					await exportPdfDirect(fp, clean, baseName + " 配套试题", baseName);
 					new Notice("PDF已保存");
 				} else {
-					require("fs").writeFileSync(fp, clean, "utf-8");
+					fs.writeFileSync(fp, clean, "utf-8");
 					new Notice("MD已保存");
 				}
 			});
@@ -1225,7 +1222,7 @@ class MainSidebarView extends ItemView {
 				try {
 					if (isAbs(folder)) {
 						const ext = file.name.endsWith(".md") ? ".md" : "";
-						require("fs").renameSync(file.path, folder + "\\" + newName + ext);
+						fs.renameSync(file.path, folder + "\\" + newName + ext);
 					} else {
 						await this.app.fileManager.renameFile(file, folder + "/" + newName + ".md");
 					}
@@ -1236,7 +1233,7 @@ class MainSidebarView extends ItemView {
 			actBtn("🗑", "删除", async () => {
 				if (!confirm("确定删除 " + file.name + "？")) return;
 				try {
-					if (isAbs(folder)) { deleteFileAbs(file.path); } else { await this.app.vault.delete(file); }
+					if (isAbs(folder)) { deleteFileAbs(file.path); } else { await this.app.fileManager.trashFile(file); }
 					new Notice("已删除");
 					await this.render();
 				} catch (err) { new Notice("删除失败：" + (err as Error).message); }
@@ -1279,8 +1276,6 @@ class MainSidebarView extends ItemView {
 	async listQuestionFiles(folder: string): Promise<TFile[]> {
 		if (isAbs(folder)) {
 			try {
-				const fs = require("fs");
-				const path = require("path");
 				if (!fs.existsSync(folder)) return [];
 				const files = fs.readdirSync(folder).filter((f: string) => f.endsWith(".md"));
 				return files.map((f: string) => {
@@ -1437,7 +1432,7 @@ class MainSidebarView extends ItemView {
 		delBtn.addEventListener("click", async (e) => {
 			e.stopPropagation();
 			if (isAbs(this.plugin.settings.wrongBookFolder)) deleteFileAbs(note.filePath);
-			else { const file = this.app.vault.getAbstractFileByPath(note.filePath); if (file instanceof TFile) await this.app.vault.delete(file); }
+			else { const file = this.app.vault.getAbstractFileByPath(note.filePath); if (file instanceof TFile) await this.app.fileManager.trashFile(file); }
 			new Notice("已删除");
 			this.plugin.emitDataChanged();
 			await this.renderWrongList();
@@ -1530,7 +1525,7 @@ class MainSidebarView extends ItemView {
 
 	async wrongDeleteNote(note: WrongAnswerNote) {
 		if (isAbs(this.plugin.settings.wrongBookFolder)) deleteFileAbs(note.filePath);
-		else { const file = this.app.vault.getAbstractFileByPath(note.filePath); if (file instanceof TFile) await this.app.vault.delete(file); }
+		else { const file = this.app.vault.getAbstractFileByPath(note.filePath); if (file instanceof TFile) await this.app.fileManager.trashFile(file); }
 		new Notice("已删除");
 		this.plugin.emitDataChanged();
 		this.wrongView = "list";
@@ -1547,7 +1542,6 @@ class MainSidebarView extends ItemView {
 		if (src) { sourceText = await this.app.vault.read(src); found = true; srcPath = src.path; }
 		else if (isAbs(this.plugin.settings.questionFolder)) {
 			const qDir = this.plugin.settings.questionFolder;
-			const fs = require("fs");
 			if (fs.existsSync(qDir)) {
 				for (const f of fs.readdirSync(qDir)) {
 					if (f.includes(srcName) && f.endsWith(".md")) { sourceText = readFileStr(qDir + "\\" + f); found = true; srcPath = qDir + "\\" + f; break; }
@@ -1568,7 +1562,6 @@ class MainSidebarView extends ItemView {
 			if (src) { sources.push(await this.app.vault.read(src)); paths.push(src.path); }
 			else if (isAbs(this.plugin.settings.questionFolder)) {
 				const qDir = this.plugin.settings.questionFolder;
-				const fs = require("fs");
 				if (fs.existsSync(qDir)) { for (const f of fs.readdirSync(qDir)) { if (f.includes(srcName) && f.endsWith(".md")) { sources.push(readFileStr(qDir + "\\" + f)); paths.push(qDir + "\\" + f); break; } } }
 			}
 		}
@@ -1585,7 +1578,7 @@ class MainSidebarView extends ItemView {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
 				const mdContent = "# " + note.baseName + "\n\n> 来源：" + (srcName || "未知") + "　|　日期：" + dateStr + "\n\n" + stripAnswerSummarySection(note.resultText);
-				require("fs").writeFileSync(r.filePath, mdContent, "utf-8");
+				fs.writeFileSync(r.filePath, mdContent, "utf-8");
 				new Notice("MD文件已保存");
 			} else if (format === "word") {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
@@ -1593,7 +1586,7 @@ class MainSidebarView extends ItemView {
 				const children = buildWordParagraphs(note.resultText, note.baseName, srcName + " " + dateStr);
 				const doc = new Document({ sections: [{ properties: {}, children }] });
 				const buffer = await Packer.toBuffer(doc);
-				require("fs").writeFileSync(r.filePath, Buffer.from(buffer));
+				fs.writeFileSync(r.filePath, Buffer.from(buffer));
 				new Notice("Word文件已保存");
 			} else if (format === "pdf") {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: note.baseName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
@@ -2110,7 +2103,7 @@ class MainSidebarView extends ItemView {
 					cb.checked ? this.examSelected.add(child.path) : this.examSelected.delete(child.path);
 					infoEl.setText("共 " + this.examFiles.length + " 个文档，已选 " + this.examSelected.size + " 个");
 				});
-				const nameSpan = row.createEl("span", { text: child.name, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" } });
+				row.createEl("span", { text: child.name, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" } });
 				if (child.file) {
 					row.createEl("span", { text: Math.round(child.file.stat.size / 1024) + "KB", attr: { style: "color:var(--text-muted);font-size:16px;flex-shrink:0;" } });
 					const d = new Date(child.file.stat.mtime);
@@ -2291,50 +2284,46 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 
 	async callAIWithPrompt(prompt: string): Promise<string> {
 		const cfg = this.plugin.settings;
-		let full = "";
 		const controller = new AbortController();
 		this.genAbortController = controller;
-		const timeoutId = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
+		const timeoutId = window.setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
 
 		try {
+			let full = "";
 			if (cfg.apiType === "ollama") {
 				const url = cfg.baseUrl + "/api/generate";
-				const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: cfg.modelName, prompt, stream: true, temperature: cfg.temperature }), signal: controller.signal });
-				if (!res.ok) { const errText = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + ": " + res.statusText + " " + errText); }
-				const reader = res.body?.getReader();
-				const decoder = new TextDecoder();
-				if (!reader) throw new Error("接口无返回流");
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const lines = decoder.decode(value).split("\n").filter(Boolean);
-					for (const line of lines) {
-						try { const data = JSON.parse(line) as OllamaResponse; full += data.response || ""; } catch {}
-					}
-				}
+				const res = await requestUrl({
+					url,
+					method: "POST",
+					contentType: "application/json",
+					body: JSON.stringify({ model: cfg.modelName, prompt, stream: false, temperature: cfg.temperature }),
+				});
+				const data = res.json as OllamaResponse;
+				full = data.response || "";
 			} else {
 				const url = cfg.baseUrl + "/v1/chat/completions";
-				const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.apiKey }, body: JSON.stringify({ model: cfg.modelName, temperature: cfg.temperature, stream: true, messages: [{ role: "system", content: "你是专业的试卷识别助手，严格按照指定格式输出题目。" }, { role: "user", content: prompt }] }), signal: controller.signal });
-				if (!res.ok) { const errText = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + ": " + res.statusText + " " + errText); }
-				const reader = res.body?.getReader();
-				const decoder = new TextDecoder();
-				if (!reader) throw new Error("接口无返回流");
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const lines = decoder.decode(value).split("\n").filter(Boolean);
-					for (const line of lines) {
-						if (!line.startsWith("data: ")) continue;
-						const jsonStr = line.replace("data: ", "");
-						if (jsonStr === "[DONE]") continue;
-						try { const data = JSON.parse(jsonStr) as OpenAIChunk; full += data.choices?.[0]?.delta?.content || ""; } catch {}
-					}
-				}
+				const res = await requestUrl({
+					url,
+					method: "POST",
+					contentType: "application/json",
+					headers: { "Authorization": "Bearer " + cfg.apiKey },
+					body: JSON.stringify({
+						model: cfg.modelName,
+						temperature: cfg.temperature,
+						stream: false,
+						messages: [
+							{ role: "system", content: "你是专业的试卷识别助手，严格按照指定格式输出题目。" },
+							{ role: "user", content: prompt }
+						]
+					}),
+				});
+				const data = res.json as any;
+				full = data.choices?.[0]?.message?.content || "";
 			}
-			clearTimeout(timeoutId);
+			window.clearTimeout(timeoutId);
 			return full;
 		} catch (err) {
-			clearTimeout(timeoutId);
+			window.clearTimeout(timeoutId);
 			throw err;
 		} finally {
 			this.genAbortController = null;
@@ -2345,7 +2334,6 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 		const now = new Date();
 		const dateStr = now.getFullYear() + "-" + String(now.getMonth() + 1).padStart(2, "0") + "-" + String(now.getDate()).padStart(2, "0");
 		const timeStr = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0");
-		const tagStr = tags.length > 0 ? tags.join(", ") : "试卷, AI识别";
 		return "---\ntitle: \"" + sourceName + " - AI识别试卷\"\ndate: " + dateStr + "T" + timeStr + "\ntags:\n  - 试卷\n  - AI识别" + (tags.length > 0 ? "\n" + tags.map(t => "  - " + t).join("\n") : "") + "\nsourceType: ai-extracted\nsource: \"" + sourceName + "\"\n---\n\n";
 	}
 
@@ -2533,74 +2521,68 @@ ${cleanSource}
 		const prompt = this.genBuildPrompt(typeStr);
 		let full = "";
 		this.genIsGenerating = true;
-		this.genAbortController = new AbortController();
 
 		try {
-			const timeoutId = setTimeout(() => this.genAbortController?.abort(), AI_REQUEST_TIMEOUT_MS);
+			const timeoutId = window.setTimeout(() => { if (this.genAbortController) this.genAbortController.abort(); }, AI_REQUEST_TIMEOUT_MS);
 
 			if (cfg.apiType === "ollama") {
 				const url = cfg.baseUrl + "/api/generate";
-				const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: cfg.modelName, prompt, stream: true, temperature: cfg.temperature }), signal: this.genAbortController.signal });
-				if (!res.ok) { const errText = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + ": " + res.statusText + " " + errText); }
-				const reader = res.body?.getReader();
-				const decoder = new TextDecoder();
-				if (!reader) throw new Error("接口无返回流");
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const lines = decoder.decode(value).split("\n").filter(Boolean);
-					for (const line of lines) {
-						try { const data = JSON.parse(line) as OllamaResponse; full += data.response || ""; onChunk(full); } catch {}
-					}
-				}
+				const res = await requestUrl({
+					url,
+					method: "POST",
+					contentType: "application/json",
+					body: JSON.stringify({ model: cfg.modelName, prompt, stream: false, temperature: cfg.temperature }),
+				});
+				const data = res.json as OllamaResponse;
+				full = data.response || "";
 			} else {
 				const url = cfg.baseUrl + "/v1/chat/completions";
-				const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "Authorization": "Bearer " + cfg.apiKey }, body: JSON.stringify({ model: cfg.modelName, temperature: cfg.temperature, stream: true, messages: [{ role: "system", content: "你是一个出题助手，严格按照指定格式输出题目。" }, { role: "user", content: prompt }] }), signal: this.genAbortController.signal });
-				if (!res.ok) { const errText = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + ": " + res.statusText + " " + errText); }
-				const reader = res.body?.getReader();
-				const decoder = new TextDecoder();
-				if (!reader) throw new Error("接口无返回流");
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					const lines = decoder.decode(value).split("\n").filter(Boolean);
-					for (const line of lines) {
-						if (!line.startsWith("data: ")) continue;
-						const jsonStr = line.replace("data: ", "");
-						if (jsonStr === "[DONE]") continue;
-						try { const data = JSON.parse(jsonStr) as OpenAIChunk; full += data.choices?.[0]?.delta?.content || ""; onChunk(full); } catch {}
-					}
-				}
+				const res = await requestUrl({
+					url,
+					method: "POST",
+					contentType: "application/json",
+					headers: { "Authorization": "Bearer " + cfg.apiKey },
+					body: JSON.stringify({
+						model: cfg.modelName,
+						temperature: cfg.temperature,
+						stream: false,
+						messages: [
+							{ role: "system", content: "你是一个出题助手，严格按照指定格式输出题目。" },
+							{ role: "user", content: prompt }
+						]
+					}),
+				});
+				const data = res.json as any;
+				full = data.choices?.[0]?.message?.content || "";
 			}
-			clearTimeout(timeoutId);
+			window.clearTimeout(timeoutId);
 
 			if (!full) { onChunk("接口返回内容为空，请检查模型名称和接口地址配置是否正确。"); return; }
 
 			const { tags: aiTags, cleanText } = this.parseAITagsFromResult(full);
 			this.genAITags = aiTags;
 			full = cleanText;
+			onChunk(full);
 
 			const questions = parseQuestions(full);
 			const gradableCount = questions.filter(q => q.type !== "essay" && q.type !== "blank").length;
 			spinner.setText("✅ 生成完成");
 			const tagInfo = aiTags.length > 0 ? " | 知识点：" + aiTags.join(", ") : "";
 			subText.setText("共解析出 " + questions.length + " 题（客观题 " + gradableCount + " 题）" + tagInfo + (questions.length === 0 ? " ⚠️ 请检查AI输出格式" : ""));
-			onChunk(full);
 
 			const entry: HistoryEntry = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), timestamp: Date.now(), fileName: this.genFileName, sourceSnippet: this.genSourceText.slice(0, MAX_HISTORY_SNIPPET), resultText: full, sourcePath: this.genSourcePath };
 			await this.plugin.addHistory(entry);
 			if (cfg.autoSave && full) await this.genSaveToVault();
 		} catch (err) {
 			if ((err as Error).name === "AbortError") {
-				if (full) { spinner.setText("⚠️ 已中止"); subText.setText("已获取部分内容（" + full.length + " 字符）"); }
-				else { spinner.setText("❌ 已取消"); subText.setText("未获取到内容"); }
+				spinner.setText("⚠️ 已中止");
+				subText.setText("未获取到完整内容");
 				return;
 			}
 			spinner.setText("❌ 生成失败");
 			onChunk("接口调用失败：" + (err as Error).message + "\n\n请检查：\n1. 接口地址\n2. API服务是否运行\n3. 模型名称");
 		} finally {
 			this.genIsGenerating = false;
-			this.genAbortController = null;
 		}
 	}
 
@@ -2668,7 +2650,7 @@ ${cleanSource}
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
-			require("fs").writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + stripAnswerSummarySection(this.genResultText), "utf-8");
+			fs.writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + stripAnswerSummarySection(this.genResultText), "utf-8");
 			new Notice("MD已保存");
 		} catch (err) { new Notice("导出失败：" + (err as Error).message); }
 	}
@@ -2683,7 +2665,7 @@ ${cleanSource}
 			const children = buildWordParagraphs(this.genResultText, this.genFileName + " 配套试题", this.genFileName + " " + dateStr);
 			const doc = new Document({ sections: [{ properties: {}, children }] });
 			const buffer = await Packer.toBuffer(doc);
-			require("fs").writeFileSync(r.filePath, Buffer.from(buffer));
+			fs.writeFileSync(r.filePath, Buffer.from(buffer));
 			new Notice("Word已保存");
 		} catch (err) { new Notice("导出失败：" + (err as Error).message); }
 	}
@@ -2707,7 +2689,7 @@ ${cleanSource}
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题_无答案.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
-			require("fs").writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题（无答案版）\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + noAnswerText, "utf-8");
+			fs.writeFileSync(r.filePath, "# " + this.genFileName + " 配套试题（无答案版）\n\n> 来源：" + this.genFileName + "　|　日期：" + dateStr + "\n\n" + noAnswerText, "utf-8");
 			new Notice("无答案版已保存");
 		} catch (err) { new Notice("导出失败：" + (err as Error).message); }
 	}
@@ -2725,7 +2707,6 @@ ${cleanSource}
 			if (src) { sources.push(await this.app.vault.read(src)); paths.push(src.path); }
 			else if (isAbs(this.plugin.settings.questionFolder)) {
 				const qDir = this.plugin.settings.questionFolder;
-				const fs = require("fs");
 				if (fs.existsSync(qDir)) { for (const f of fs.readdirSync(qDir)) { if (f.includes(srcName) && f.endsWith(".md")) { sources.push(readFileStr(qDir + "\\" + f)); paths.push(qDir + "\\" + f); break; } } }
 			}
 		}
@@ -2753,7 +2734,7 @@ ${cleanSource}
 		el.empty();
 
 		const backBtn = el.createEl("button", { text: "← 返回", attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);font-size:19px;margin-bottom:10px;" } });
-		backBtn.addEventListener("click", () => { if (this.answerTimerInterval) { clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; } this.homeView = "default"; this.renderHomeTab(); });
+		backBtn.addEventListener("click", () => { if (this.answerTimerInterval) { window.clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; } this.homeView = "default"; this.renderHomeTab(); });
 
 		if (this.answerQuestions.length === 0) {
 			el.createEl("p", { text: "未能解析出可答题的题目。", attr: { style: "color:var(--text-muted);padding:20px 0;" } });
@@ -2814,7 +2795,7 @@ ${cleanSource}
 	}
 
 	answerSubmit() {
-		if (this.answerTimerInterval) { clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
+		if (this.answerTimerInterval) { window.clearInterval(this.answerTimerInterval); this.answerTimerInterval = null; }
 		if (!this.innerContentEl) return;
 		const el = this.innerContentEl;
 		el.empty();
@@ -3229,7 +3210,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				if (r.canceled || !r.filePath) return;
 				const dateStr = new Date().toISOString().slice(0, 10);
 				const mdHeader = title ? "# " + title + "\n\n> 来源：" + (source || title) + "　|　日期：" + dateStr + "\n\n" : "";
-				require("fs").writeFileSync(r.filePath, mdHeader + stripAnswerSummarySection(text), "utf-8");
+				fs.writeFileSync(r.filePath, mdHeader + stripAnswerSummarySection(text), "utf-8");
 				new Notice("MD文件已保存");
 			} else if (format === "word") {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".docx", filters: [{ name: "Word", extensions: ["docx"] }] });
@@ -3237,7 +3218,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				const children = buildWordParagraphs(text, title, source);
 				const doc = new Document({ sections: [{ properties: {}, children }] });
 				const buffer = await Packer.toBuffer(doc);
-				require("fs").writeFileSync(r.filePath, Buffer.from(buffer));
+				fs.writeFileSync(r.filePath, Buffer.from(buffer));
 				new Notice("Word文件已保存");
 			} else if (format === "pdf") {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
@@ -3303,7 +3284,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 					if (dueCount > 0) {
 						this.registerInterval(window.setTimeout(() => {
 							const notice = new Notice("你有 " + dueCount + " 道错题待复习，点击开始", NOTICE_DURATION_MS);
-							notice.noticeEl.addEventListener("click", async () => {
+							notice.messageEl.addEventListener("click", async () => {
 								const view = await this.activateSidebar();
 								if (view) { view.activeSection = "wrong"; view.wrongView = "list"; await view.render(); }
 							});
@@ -3369,7 +3350,6 @@ export default class QuestionGeneratorPlugin extends Plugin {
 							try {
 								const file = this.app.vault.getAbstractFileByPath(filePath);
 								if (file instanceof TFile) {
-									const fileContent = await this.app.vault.read(file);
 									const fileTitle = file.basename;
 									fullText = "文档标题：" + fileTitle + "\n\n" + selectText;
 								}
@@ -3393,7 +3373,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 						this.app.vault.read(file).then(async text => {
 							const view = await this.activateSidebar();
 							if (view) { view.activeSection = "home"; view.homeView = "generate"; view.genSourceText = text; view.genFileName = file.name; view.genSourcePath = file.path; await view.render(); }
-						});
+						}).catch(e => console.error("[question-generator]", e));
 					} else {
 						new Notice("请先打开一个Markdown文档再使用 Ctrl+Q");
 					}
@@ -3402,7 +3382,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 					evt.preventDefault();
 					this.activateSidebar().then(async view => {
 						if (view) { view.activeSection = "wrong"; view.wrongView = "list"; await view.render(); }
-					});
+					}).catch(e => console.error("[question-generator]", e));
 				}
 			} catch (e) {
 				console.error("[question-generator] keydown error:", e);
