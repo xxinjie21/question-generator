@@ -2,6 +2,7 @@ import { App, Plugin, TFile, TFolder, Notice, ItemView, WorkspaceLeaf, requestUr
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, UnderlineType } from "docx";
 import * as fs from "fs";
 import * as path from "path";
+const { remote } = require("electron");
 
 // ===================== 类型定义 =====================
 interface OllamaResponse { response?: string; }
@@ -932,7 +933,7 @@ function buildExportHtml(text: string, title?: string, source?: string): string 
 
 async function exportPdfDirect(filePath: string, text: string, title?: string, source?: string) {
 	const fullHtml = buildExportHtml(text, title, source);
-	const { remote } = require("electron");
+	
 	const { BrowserWindow } = remote;
 	const win = new BrowserWindow({ show: false, width: 900, height: 1200, webPreferences: { offscreen: true } });
 	await win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(fullHtml));
@@ -1198,7 +1199,7 @@ class MainSidebarView extends ItemView {
 				const content = isAbs(folder) ? readFileStr(file.path) : await this.app.vault.read(file);
 				const clean = content.replace(/^---[\s\S]*?---\s*/, "");
 				const baseName = file.basename.replace(/_试题.*$/, "");
-				const { remote } = require("electron");
+				
 				const r = await remote.dialog.showSaveDialog({ defaultPath: file.basename + ".docx", filters: [{ name: "Word", extensions: ["docx"] }, { name: "PDF", extensions: ["pdf"] }, { name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
 				const fp = r.filePath;
@@ -1571,7 +1572,7 @@ class MainSidebarView extends ItemView {
 
 	async wrongExportNote(note: WrongAnswerNote, format: "md" | "word" | "pdf") {
 		try {
-			const { remote } = require("electron");
+			
 			const dateStr = note.date || new Date().toISOString().slice(0, 10);
 			const srcName = note.sourceFile?.replace(/\[\[|\]\]/g, "") || "";
 			if (format === "md") {
@@ -2646,7 +2647,7 @@ ${cleanSource}
 	async genExportMd() {
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
-			const { remote } = require("electron");
+			
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
@@ -2658,7 +2659,7 @@ ${cleanSource}
 	async genExportWord() {
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
-			const { remote } = require("electron");
+			
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.docx", filters: [{ name: "Word", extensions: ["docx"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
@@ -2673,7 +2674,7 @@ ${cleanSource}
 	async genExportPdf() {
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
-			const { remote } = require("electron");
+			
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题.pdf", filters: [{ name: "PDF", extensions: ["pdf"] }] });
 			if (r.canceled || !r.filePath) return;
 			await exportPdfDirect(r.filePath, this.genResultText, this.genFileName + " 配套试题", this.genFileName);
@@ -2685,7 +2686,7 @@ ${cleanSource}
 		try {
 			if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 			const noAnswerText = stripAnswersForExport(this.genResultText);
-			const { remote } = require("electron");
+			
 			const r = await remote.dialog.showSaveDialog({ defaultPath: this.genFileName + "_试题_无答案.md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 			if (r.canceled || !r.filePath) return;
 			const dateStr = new Date().toISOString().slice(0, 10);
@@ -3204,7 +3205,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 
 	async exportToFile(text: string, defaultName: string, format: "md" | "word" | "pdf", title?: string, source?: string) {
 		try {
-			const { remote } = require("electron");
+			
 			if (format === "md") {
 				const r = await remote.dialog.showSaveDialog({ defaultPath: defaultName + ".md", filters: [{ name: "Markdown", extensions: ["md"] }] });
 				if (r.canceled || !r.filePath) return;
