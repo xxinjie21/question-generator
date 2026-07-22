@@ -1,18 +1,16 @@
 <div align="center">
 
-# Smart Quiz Tutor
+# Smart Question Tutor
 
 **AI-powered quiz generator for Obsidian** — Turn your notes into quizzes with one click.
 
-[![Obsidian](https://img.shields.io/badge/Obsidian-1.4.0+-483699?style=flat-square&logo=obsidian)](https://obsidian.md)
-[![Build](https://img.shields.io/github/actions/workflow/status/xxinjie21/question-generator/lint.yml?branch=master&style=flat-square&label=build)](https://github.com/xxinjie21/question-generator/actions)
-[![Release](https://img.shields.io/github/v/release/xxinjie21/question-generator?style=flat-square&include_prereleases&label=release)](https://github.com/xxinjie21/question-generator/releases)
-[![Stars](https://img.shields.io/github/stars/xxinjie21/question-generator?style=flat-square&logo=github)](https://github.com/xxinjie21/question-generator/stargazers)
+[![Obsidian](https://img.shields.io/badge/Obsidian-1.12.0+-483699?style=flat-square&logo=obsidian)](https://obsidian.md)
+[![Build](https://img.shields.io/github/actions/workflow/status/xxinjie21/Smart-Quiz-Tutor/lint.yml?branch=master&style=flat-square&label=build)](https://github.com/xxinjie21/Smart-Quiz-Tutor/actions)
+[![Release](https://img.shields.io/github/v/release/xxinjie21/Smart-Quiz-Tutor?style=flat-square&include_prereleases&label=release)](https://github.com/xxinjie21/Smart-Quiz-Tutor/releases)
+[![Stars](https://img.shields.io/github/stars/xxinjie21/Smart-Quiz-Tutor?style=flat-square&logo=github)](https://github.com/xxinjie21/Smart-Quiz-Tutor/stargazers)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue.svg?style=flat-square&logo=typescript)](https://www.typescriptlang.org)
 [![AI](https://img.shields.io/badge/AI-Ollama%20%7C%20OpenAI-brightgreen.svg?style=flat-square)](https://ollama.com)
 [![License](https://img.shields.io/badge/License-ISC-blue.svg?style=flat-square)](LICENSE)
-
-> **中文用户**：[查看中文说明](README.zh.md) | **English**: Read below
 
 **[Features](#features) • [Quick Start](#quick-start) • [Commands](#commands) • [Configuration](#configuration) • [Contributing](#contributing) • [License](#license)**
 
@@ -77,15 +75,15 @@
 
 ### Manual Install
 ```bash
-git clone https://github.com/xxinjie21/question-generator.git
-cd question-generator
+git clone https://github.com/xxinjie21/Smart-Quiz-Tutor.git
+cd Smart-Quiz-Tutor
 npm install
 npm run build
 ```
 
 Copy to your vault:
 ```
-your-vault/.obsidian/plugins/question-generator/
+your-vault/.obsidian/plugins/Smart-Quiz-Tutor/
 ├── main.js
 ├── manifest.json
 └── styles.css
@@ -146,7 +144,7 @@ Customize in **Settings → Hotkeys**.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
-[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespace-ready-24292f?style=flat-square&logo=github)](https://github.com/codespaces/new?hide_repo_select=true&ref=master&repo=xxinjie21/question-generator)
+[![Open in GitHub Codespaces](https://img.shields.io/badge/Codespace-ready-24292f?style=flat-square&logo=github)](https://github.com/codespaces/new?hide_repo_select=true&ref=master&repo=xxinjie21/Smart-Quiz-Tutor)
 
 ---
 
