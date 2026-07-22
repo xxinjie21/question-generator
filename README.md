@@ -20,21 +20,7 @@
 
 ---
 
-## Demo
 
-<!-- Replace these placeholders with actual screenshots/GIFs -->
-<table>
-  <tr>
-    <td align="center"><strong>AI Quiz Generation</strong><br><img src="https://via.placeholder.com/400x250/483699/ffffff?text=Screenshot+Coming+Soon" alt="Quiz Generation" width="400"></td>
-    <td align="center"><strong>Answer Mode</strong><br><img src="https://via.placeholder.com/400x250/2E7D32/ffffff?text=Screenshot+Coming+Soon" alt="Answer Mode" width="400"></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Wrong Answer Book</strong><br><img src="https://via.placeholder.com/400x250/1565C0/ffffff?text=Screenshot+Coming+Soon" alt="Wrong Book" width="400"></td>
-    <td align="center"><strong>Export to Word/PDF</strong><br><img src="https://via.placeholder.com/400x250/6A1B9A/ffffff?text=Screenshot+Coming+Soon" alt="Export" width="400"></td>
-  </tr>
-</table>
-
----
 
 ## Features
 
@@ -179,8 +165,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 ## Support
 
 If this plugin helps your learning, consider giving it a ⭐ on GitHub!
-
-[![Star History](https://api.star-history.com/svg?repos=xxinjie21/question-generator&type=Date)](https://star-history.com/#xxinjie21/question-generator&Date)
 
 ---
 
