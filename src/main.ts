@@ -339,6 +339,7 @@ export function stripAnswersForExport(text: string): string {
 // ===================== 间隔重复 (对错计数) =====================
 const DEFAULT_WRONG_INTERVALS = [1, 2, 4, 7, 15, 30];
 const DEFAULT_QUESTION_INTERVALS = [7, 15, 30, 60, 90];
+const DEFAULT_NOTE_INTERVALS = [2, 6, 14, 35, 70];
 function parseReviewIntervals(s: string, fallback: number[]): number[] {
 	const nums = s.split(",").map(v => parseInt(v.trim())).filter(v => v > 0);
 	return nums.length > 0 ? nums : fallback;
@@ -401,11 +402,11 @@ export function parseQuestions(text: string): ParsedQuestion[] {
 		textToParse = cleaned.slice(0, summaryStart);
 	}
 
-	const qBlocks = textToParse.split(/\n(?=\d+[.、）)\s])/);
+	const qBlocks = textToParse.split(/\n(?=(?:\*\*)?\d+[.、）)\s](?:\*\*)?\s)/);
 	for (const block of qBlocks) {
 		const lines = block.split("\n");
 		const firstLine = lines[0]?.trim() || "";
-		const numMatch = firstLine.match(/^(\d+)[.、）)\s]+\s*(.+)/);
+		const numMatch = firstLine.match(/^(?:\*\*)?(\d+)(?:\*\*)?[.、）)\s]+\s*(.+)/);
 		if (!numMatch || !numMatch[1] || !numMatch[2]) continue;
 
 		const qNum = parseInt(numMatch[1]);
@@ -657,6 +658,20 @@ export function htmlEscape(s: string): string {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+function fixSequentialNumbers(text: string): string {
+	return text.replace(/((?:^|\n)答案[：:]\s*)(.+?)(?=\n|$)/g, (_match, prefix: string, content: string) => {
+		const parts = content.split(/(?=\(\d+\)\s)/);
+		if (parts.length < 2) return prefix + content;
+		let seq = 0;
+		const fixed = parts.map((p: string) => {
+			const m = p.match(/^\(\d+\)\s(.+)/);
+			if (m) { seq++; return "(" + seq + ") " + m[1]; }
+			return p;
+		});
+		return prefix + fixed.join(" ");
+	});
+}
+
 function normalizeExamContent(text: string): string {
 	const lines = text.split("\n");
 	const result: string[] = [];
@@ -671,7 +686,7 @@ function normalizeExamContent(text: string): string {
 			lastType = "heading";
 			continue;
 		}
-		if (/^\d+[.、]/.test(trimmed)) {
+		if (/^(?:\*\*)?\d+(?:\*\*)?[.、]/.test(trimmed)) {
 			if (lastType === "answer" || lastType === "explanation" || lastType === "option" || lastType === "question") {
 				if (result.length > 0 && result[result.length - 1] !== "") result.push("");
 			}
@@ -1119,6 +1134,138 @@ class MainSidebarView extends ItemView {
 		}
 	}
 
+	async getActivityData(): Promise<Record<string, number>> {
+		const activity: Record<string, number> = {};
+		const folders = [
+			this.plugin.rootPath(this.plugin.settings.questionFolder),
+			this.plugin.rootPath(this.plugin.settings.wrongBookFolder),
+			this.plugin.rootPath(this.plugin.settings.noteViewFolder),
+		];
+		for (const folder of folders) {
+			if (!folder) continue;
+			try {
+				if (isAbs(folder)) {
+					if (!fs.existsSync(folder)) continue;
+					const files = fs.readdirSync(folder).filter((f: string) => f.endsWith(".md"));
+					for (const f of files) {
+						const fp = path.join(folder, f);
+						try {
+							const stat = fs.statSync(fp);
+							const day = new Date(stat.mtimeMs).toISOString().slice(0, 10);
+							activity[day] = (activity[day] || 0) + 1;
+						} catch { /* skip */ }
+					}
+				} else {
+					const folderObj = this.app.vault.getAbstractFileByPath(folder);
+					if (folderObj instanceof TFolder) {
+						for (const child of folderObj.children) {
+							if (child instanceof TFile && child.extension === "md") {
+								const day = new Date(child.stat.mtime).toISOString().slice(0, 10);
+								activity[day] = (activity[day] || 0) + 1;
+							}
+						}
+					}
+				}
+			} catch { /* skip */ }
+		}
+		return activity;
+	}
+
+	renderHeatmap(container: HTMLElement, activity: Record<string, number>) {
+		const today = new Date();
+		const todayStr = today.toISOString().slice(0, 10);
+		const totalDays = 364;
+		const startDate = new Date(today);
+		startDate.setDate(startDate.getDate() - totalDays);
+		startDate.setDate(startDate.getDate() - startDate.getDay());
+
+		const CELL = 11;
+		const GAP = 3;
+		const STEP = CELL + GAP;
+		const WEEKS = 53;
+		const GRID_W = WEEKS * STEP - GAP;
+		const GRID_H = 7 * STEP - GAP;
+		const DAY_LABEL_W = 28;
+		const MONTH_LABEL_H = 16;
+
+		const ghColors = ["#161b22", "#0e4429", "#006d32", "#26a641", "#39d353"];
+		const ghColorsLight = ["#ebedf0", "#9be9a8", "#40c463", "#30a14e", "#216e39"];
+		const isDark = document.body.classList.contains("theme-dark");
+		const palette = isDark ? ghColors : ghColorsLight;
+		const getLevel = (val: number): number => {
+			if (val === 0) return 0;
+			if (val >= 10) return 4;
+			if (val >= 6) return 3;
+			if (val >= 3) return 2;
+			return 1;
+		};
+
+		const totalActivities = Object.values(activity).reduce((a, b) => a + b, 0);
+		const activeDays = Object.keys(activity).length;
+		container.createDiv({ text: "学习热力图", attr: { style: "font-size:16px;font-weight:600;color:var(--text-muted);margin-bottom:2px;" } });
+		container.createDiv({ text: "过去一年共 " + totalActivities + " 次学习活动，" + activeDays + " 天有记录", attr: { style: "color:var(--text-muted);font-size:13px;margin-bottom:10px;" } });
+
+		const wrap = container.createDiv({ attr: { style: "overflow-x:auto;" } });
+		const outer = wrap.createDiv({ attr: { style: "display:inline-flex;gap:0;" } });
+
+		const dayCol = outer.createDiv({ attr: { style: "width:" + DAY_LABEL_W + "px;padding-top:" + MONTH_LABEL_H + "px;" } });
+		const dayLabels = ["", "一", "", "三", "", "五", ""];
+		for (const dl of dayLabels) {
+			const row = dayCol.createDiv({ attr: { style: "height:" + STEP + "px;display:flex;align-items:center;font-size:10px;color:var(--text-faint);" } });
+			row.setText(dl);
+		}
+
+		const right = outer.createDiv({ attr: { style: "display:flex;flex-direction:column;" } });
+
+		const monthRow = right.createDiv({ attr: { style: "height:" + MONTH_LABEL_H + "px;position:relative;width:" + GRID_W + "px;" } });
+		const monthNames = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+		let lastMonth = -1;
+		for (let col = 0; col < WEEKS; col++) {
+			const d = new Date(startDate);
+			d.setDate(d.getDate() + col * 7);
+			const m = d.getMonth();
+			if (m !== lastMonth) {
+				const lbl = monthRow.createDiv({ attr: { style: "position:absolute;left:" + (col * STEP) + "px;font-size:10px;color:var(--text-faint);white-space:nowrap;" } });
+				lbl.setText(monthNames[m]!);
+				lastMonth = m;
+			}
+		}
+
+		const grid = right.createDiv({ attr: { style: "position:relative;width:" + GRID_W + "px;height:" + GRID_H + "px;" } });
+
+		for (let col = 0; col < WEEKS; col++) {
+			for (let row = 0; row < 7; row++) {
+				const d = new Date(startDate);
+				d.setDate(d.getDate() + col * 7 + row);
+				const ds = d.toISOString().slice(0, 10);
+				const val = activity[ds] || 0;
+				const level = getLevel(val);
+
+				const cell = grid.createDiv({ attr: { style: "position:absolute;width:" + CELL + "px;height:" + CELL + "px;border-radius:2px;left:" + (col * STEP) + "px;top:" + (row * STEP) + "px;background:" + palette[level] + ";cursor:default;" } });
+
+				const monthNamesCN = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"];
+				const dateLabel = monthNamesCN[d.getMonth()]! + d.getDate() + "日";
+				if (val > 0) {
+					cell.setAttribute("title", val + " 次学习活动 · " + dateLabel);
+				} else {
+					cell.setAttribute("title", "无活动 · " + dateLabel);
+				}
+
+				if (ds === todayStr) {
+					cell.setAttribute("title", cell.getAttribute("title") + " (今天)");
+					cell.createDiv({ attr: { style: "position:absolute;inset:-1px;border-radius:2px;outline:1px solid var(--text-normal);" } });
+				}
+			}
+		}
+
+		const legend = right.createDiv({ attr: { style: "display:flex;align-items:center;gap:3px;font-size:10px;color:var(--text-faint);justify-content:flex-end;margin-top:4px;" } });
+		legend.createSpan({ text: "Less" });
+		for (let i = 0; i < palette.length; i++) {
+			legend.createDiv({ attr: { style: "width:" + CELL + "px;height:" + CELL + "px;border-radius:2px;background:" + palette[i] + ";" } });
+		}
+		legend.createSpan({ text: "More" });
+	}
+
 	async renderHomeDefault() {
 		if (!this.innerContentEl) return;
 		const el = this.innerContentEl;
@@ -1141,6 +1288,10 @@ class MainSidebarView extends ItemView {
 		dueCard.addEventListener("click", () => { this.activeSection = "review"; void this.render(); });
 		const wCard = miniCard("错题", String(stats.totalWrong), stats.totalWrong > 0 ? "var(--color-red)" : undefined);
 		wCard.addEventListener("click", () => { this.activeSection = "wrong"; this.wrongView = "list"; void this.render(); });
+
+		const heatmapSection = el.createDiv({ attr: { style: "margin-bottom:14px;padding:12px;border-radius:8px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);overflow:hidden;" } });
+		const heatmapData = await this.getActivityData();
+		this.renderHeatmap(heatmapSection, heatmapData);
 
 		const actSection = el.createDiv({ attr: { style: "margin-bottom:14px;" } });
 		actSection.createDiv({ text: "快捷操作", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;" } });
@@ -2069,7 +2220,7 @@ class MainSidebarView extends ItemView {
 	}
 
 	private renderReviewRow(container: HTMLElement, item: { note: WrongAnswerNote; source: string }, sourceLabel: Record<string, string>, sourceColor: Record<string, string>, daysUntil: (s: string) => number, compact = false) {
-		const row = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:" + (compact ? "4px 8px" : "6px 8px") + ";margin-bottom:4px;border-radius:4px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:18px;transition:background 0.15s;" } });
+		const row = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:" + (compact ? "4px 8px" : "6px 8px") + ";margin-bottom:4px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;transition:background 0.15s;" } });
 		row.classList.add("qg-hover-bg");
 		row.createSpan({ text: sourceLabel[item.source] || item.source, attr: { style: "min-width:32px;font-size:13px;padding:1px 5px;border-radius:3px;background:" + (sourceColor[item.source] || "var(--text-muted)") + ";color:white;" } });
 		const nameText = (item.note.sourceFile || item.note.baseName).replace(/\[\[|\]\]/g, "");
@@ -2085,10 +2236,41 @@ class MainSidebarView extends ItemView {
 				row.createSpan({ text: daysUntil(item.note.nextReview) + "天后", attr: { style: "font-size:15px;color:var(--text-faint);min-width:44px;text-align:right;" } });
 			}
 		}
+		const doneBtn = row.createEl("button", { text: "✓ 完成", attr: { style: "padding:2px 8px;border-radius:3px;cursor:pointer;font-size:15px;border:1px solid var(--color-green);background:transparent;color:var(--color-green);white-space:nowrap;" } });
+		doneBtn.addEventListener("click", (e) => { e.stopPropagation(); void this.markReviewDone(item.note, item.source); });
 		row.addEventListener("click", () => {
 			if (item.source === "wrong") { this.wrongView = "detail"; this.wrongCurrentNote = item.note; this.activeSection = "wrong"; void this.render(); }
 			else { void this.app.workspace.openLinkText(item.note.baseName, "", false); }
 		});
+	}
+
+	private async markReviewDone(note: WrongAnswerNote, source: string) {
+		const intervals = source === "wrong" ? parseReviewIntervals(this.plugin.settings.wrongReviewIntervals, DEFAULT_WRONG_INTERVALS)
+			: source === "question" ? parseReviewIntervals(this.plugin.settings.questionReviewIntervals, DEFAULT_QUESTION_INTERVALS)
+			: parseReviewIntervals(this.plugin.settings.noteReviewIntervals, DEFAULT_NOTE_INTERVALS);
+		const result = reviewUpdate(note.correctCount || 0, true, intervals);
+		if (isAbs(this.plugin.rootPath(this.plugin.settings.wrongBookFolder))) {
+			const content = readFileStr(note.filePath);
+			const { meta, body } = parseFM(content);
+			meta.interval = result.interval;
+			meta.correctCount = result.correctCount;
+			meta.nextReview = result.nextReview;
+			if (note.wrongCount) meta.wrongCount = note.wrongCount;
+			writeFileStr(note.filePath, buildFM(meta) + body);
+		} else {
+			const file = this.app.vault.getAbstractFileByPath(note.filePath);
+			if (!(file instanceof TFile)) return;
+			const content = await this.app.vault.read(file);
+			const { meta, body } = parseFM(content);
+			meta.interval = result.interval;
+			meta.correctCount = result.correctCount;
+			meta.nextReview = result.nextReview;
+			if (note.wrongCount) meta.wrongCount = note.wrongCount;
+			await this.app.vault.modify(file, buildFM(meta) + body);
+		}
+		new Notice("已标记完成！下次复习 " + result.nextReview + "（间隔" + result.interval + "天）");
+		this.plugin.emitDataChanged();
+		void this.renderReviewTab();
 	}
 
 	// ===================== SETTINGS TAB =====================
@@ -2171,19 +2353,19 @@ class MainSidebarView extends ItemView {
 
 		const intervalPresets: Record<string, { label: string; hint: string; values: string; range: string }[]> = {
 			wrong: [
-				{ label: "慢速", hint: "适合基础扎实、偶尔出错的知识点", values: "2,5,10,20,40,60", range: "首间隔2天，总周期约137天" },
-				{ label: "标准", hint: "适合大部分错题复习（推荐）", values: "1,2,4,7,15,30", range: "首间隔1天，总周期约59天" },
-				{ label: "快速", hint: "适合频繁出错、需要强化的知识点", values: "1,1,2,3,5,7", range: "首间隔1天，总周期约19天" },
+				{ label: "慢速", hint: "复盘间隔长、执行省心，适合已初步掌握、仅需定期回顾的错题", values: "2,5,10,20,40,60", range: "" },
+				{ label: "标准", hint: "考前日常训练主力方案，遗忘曲线与复习节奏平衡", values: "1,2,4,7,15,30", range: "" },
+				{ label: "快速", hint: "前期隔天密集复盘，适合频繁出错的高频薄弱点", values: "1,1,3,5,10,20", range: "" },
 			],
 			question: [
-				{ label: "慢速", hint: "适合已掌握的知识点巩固", values: "14,30,60,90,120,180", range: "首间隔14天，总周期约1.7年" },
-				{ label: "标准", hint: "适合新生成的题目复习（推荐）", values: "7,15,30,60,90", range: "首间隔7天，总周期约207天" },
-				{ label: "快速", hint: "适合需要快速消化的大量题目", values: "3,5,10,15,30", range: "首间隔3天，总周期约63天" },
+				{ label: "慢速", hint: "适合基础扎实、掌握牢固、几乎不会遗忘的简单题目", values: "10,20,40,80,120", range: "" },
+				{ label: "标准", hint: "覆盖范围广、周期适中，配合考研各阶段节奏", values: "7,15,30,60,90", range: "" },
+				{ label: "快速", hint: "加密前期间隔、反复强化，适合刚学完的重难点", values: "4,8,18,40,60", range: "" },
 			],
 			note: [
-				{ label: "慢速", hint: "适合长期知识积累型笔记", values: "3,7,14,30,60,90", range: "首间隔3天，总周期约204天" },
-				{ label: "标准", hint: "适合课堂笔记、读书笔记（推荐）", values: "1,3,7,14,30", range: "首间隔1天，总周期约55天" },
-				{ label: "快速", hint: "适合考前突击、临时笔记", values: "1,1,2,3,5", range: "首间隔1天，总周期约12天" },
+				{ label: "慢速", hint: "长线缓释记忆，适合考研基础阶段按部就班的日常背诵", values: "3,8,20,45,80", range: "" },
+				{ label: "标准", hint: "中等密度、长线巩固，强化期系统性复习主力配置", values: "2,6,14,35,70", range: "" },
+				{ label: "快速", hint: "考前冲刺专用，短期高频轰炸、以速度换覆盖", values: "1,1,2,3,5", range: "" },
 			],
 		};
 
@@ -2201,7 +2383,7 @@ class MainSidebarView extends ItemView {
 			const activePreset = currentPreset || presets[1]!;
 			const tipRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:16px;color:var(--text-muted);" } });
 			tipRow.createSpan({ text: "💡", attr: { style: "font-size:14px;" } });
-			tipRow.createSpan({ text: activePreset.hint + "。" + activePreset.range });
+			tipRow.createSpan({ text: activePreset.hint });
 			const customRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;" } });
 			customRow.createSpan({ text: "自定义：", attr: { style: "font-size:16px;color:var(--text-muted);flex-shrink:0;" } });
 			const inp = customRow.createEl("input", { attr: { type: "text", value: currentValue, style: "flex:1;padding:4px 6px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:16px;font-family:monospace;", placeholder: "如 1,2,4,7,15,30" } });
@@ -2669,6 +2851,7 @@ D. 选项D文本
 7. 不要在文末输出答案汇总
 8. 简答题答案必须用数字序号（1. 2. 3.）列出踩分点，每个序号单独一行
 9. 答案中多个要点（1. xxx 2. xxx 3. xxx）必须每个要点单独一行
+11. 编号必须连续递增：1. 2. 3. 4. 5.，绝对禁止跳号（如 1. 3. 5.）或乱序
 10. 在所有题目输出完毕后，最后一行必须输出：知识点：tag1, tag2, tag3（根据内容精准提取3-8个核心知识点，用逗号分隔）
 
 【重要提示】
@@ -2992,14 +3175,14 @@ ${content.slice(0, 12000)}`;
 		const cleanSource = cleanSourceText(this.genSourceText);
 		const existingTags = await this.plugin.loadExistingKnowledgeTags();
 		const existingTagsHint = existingTags.length > 0 ? "\n【已有的知识点标签（请优先使用这些标签）】\n" + existingTags.join("、") + "\n" : "";
-		const noMdRules = "\n\n【铁律 - 绝对禁止】\n1. 绝对不要使用任何Markdown格式\n2. 题号格式固定为：数字. 题干文本\n3. 选项格式固定为：A. 选项文本\n4. 答案行格式固定为：答案：A 或 答案：AB 或 答案：填写内容\n5. 解析行格式固定为：解析：解释文本\n6. 每道题之间必须空一行\n7. 不要在文末输出答案汇总\n8. 简答题答案必须用数字序号（1. 2. 3.）列出踩分点，每个序号单独一行\n9. 答案中多个要点（1. xxx 2. xxx 3. xxx）必须每个要点单独一行\n10. 在所有题目输出完毕后，最后一行必须输出：知识点：tag1, tag2, tag3（根据已有知识点标签优先匹配，也可新增，3-8个，逗号分隔）\n";
+		const noMdRules = "\n\n【铁律 - 绝对禁止】\n1. 绝对不要使用任何Markdown格式\n2. 题号格式固定为：**数字.** 题干文本（注意加粗）\n3. 选项格式固定为：A. 选项文本\n4. 答案行格式固定为：答案：A 或 答案：AB 或 答案：填写内容\n5. 解析行格式固定为：解析：解释文本\n6. 每道题之间必须空一行\n7. 不要在文末输出答案汇总\n8. 简答题答案必须用括号数字序号（(1) (2) (3)）列出踩分点，每个序号单独一行\n9. 答案中多个要点（(1) xxx (2) xxx (3) xxx）必须每个要点单独一行，每道题答案独立从头排序\n10. 在所有题目输出完毕后，最后一行必须输出：知识点：tag1, tag2, tag3（根据已有知识点标签优先匹配，也可新增，3-8个，逗号分隔）\n";
 		return `你是专业出题教师，严格依据原文内容出题，禁止编造不存在知识点。
 
 【输出格式要求 - 必须严格遵守】
 必须按以下格式输出，否则系统无法解析：
 
 ## 单选题
-1. 题干文本
+**1.** 题干文本
 A. 选项A文本
 B. 选项B文本
 C. 选项C文本
@@ -3008,7 +3191,7 @@ D. 选项D文本
 解析：解释文本
 
 ## 多选题
-2. 题干文本
+**2.** 题干文本
 A. 选项A文本
 B. 选项B文本
 C. 选项C文本
@@ -3017,20 +3200,20 @@ D. 选项D文本
 解析：解释文本
 
 ## 判断题
-3. 题干文本
+**3.** 题干文本
 A. 正确
 B. 错误
 答案：A
 解析：解释文本
 
 ## 填空题
-4. 题干文本，其中空缺部分用（）表示
+**4.** 题干文本，其中空缺部分用（）表示
 答案：填写的内容
 解析：解释文本
 
 ## 简答题
-5. 题干文本
-答案：1. 第一个踩分点内容 2. 第二个踩分点内容 3. 第三个踩分点内容
+**5.** 题干文本
+答案：(1) 第一个踩分点内容 (2) 第二个踩分点内容 (3) 第三个踩分点内容
 解析：解释文本
 ${noMdRules}
 ${existingTagsHint}
@@ -3039,8 +3222,8 @@ ${cleanSource}
 
 题目数量：${typeStr}
 规则：无对应知识点直接跳过，不要虚构内容。
-【简答题答案格式要求】
-简答题答案必须使用数字序号（1. 2. 3.）列出踩分点，禁止使用"第一步""第二步"等文字描述。
+		【简答题答案格式要求】
+		简答题答案必须使用括号数字序号（(1) (2) (3)）列出踩分点，禁止使用"第一步""第二步"等文字描述。每道题的答案序号独立从头编号。
 【知识点提取】
 在所有题目输出完毕后，最后一行必须输出：
 知识点：根据已有知识点标签优先匹配，也可新增（3-8个，逗号分隔）`;
@@ -3107,7 +3290,7 @@ ${cleanSource}
 
 			const { tags: aiTags, cleanText } = this.parseAITagsFromResult(full);
 			this.genAITags = aiTags;
-			full = cleanText;
+			full = fixSequentialNumbers(cleanText);
 			onChunk(full);
 
 			const questions = parseQuestions(full);
@@ -3306,7 +3489,7 @@ ${cleanSource}
 			headerRow.createSpan({ text: "第 " + q.number + " 题", attr: { style: "font-size:17px;color:var(--text-muted);" } });
 			if (!isGradable) headerRow.createSpan({ text: "(仅参考)", attr: { style: "font-size:16px;color:var(--text-faint);" } });
 
-			qEl.createDiv({ text: q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:8px;" } });
+			qEl.createDiv({ text: "**" + q.number + ".** " + q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:8px;" } });
 
 			if (q.type === "single" || q.type === "judge") {
 				const optsEl = qEl.createDiv({ cls: "qg-opts-col" });
@@ -3396,9 +3579,9 @@ ${cleanSource}
 				qHeader.createSpan({ text: isCorrect ? "✓ 正确" : "✗ 错误", attr: { style: "font-size:17px;padding:2px 6px;border-radius:4px;font-weight:600;" + (isCorrect ? "background:color-mix(in srgb, var(--color-green) 15%, transparent);color:var(--color-green);" : "background:color-mix(in srgb, var(--color-red) 15%, transparent);color:var(--color-red);") } });
 				qHeader.createSpan({ text: typeLabels[q.type], attr: { style: "font-size:16px;color:var(--text-muted);" } });
 
-				qEl.createDiv({ text: q.number + ". " + q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:6px;" } });
-
-				for (const opt of q.options) {
+				qEl.createDiv({ text: "**" + q.number + ".** " + q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:6px;" } });
+ 
+ 				for (const opt of q.options) {
 					const isUserChoice = q.type === "multi" ? userAnswer.includes(opt.label) : opt.label === userAnswer;
 					const isCorrectOpt = q.type === "multi" ? q.answer.includes(opt.label) : opt.label === q.answer;
 					let optStyle = "padding:2px 0;font-size:19px;line-height:1.5;";
@@ -3433,8 +3616,8 @@ ${cleanSource}
 				wCb.addEventListener("change", () => { wCb.checked ? this.answerWrongChecked.add(q.number) : this.answerWrongChecked.delete(q.number); });
 				qHeader.createSpan({ text: typeLabels[q.type], attr: { style: "font-size:16px;padding:2px 6px;border-radius:4px;background:var(--interactive-accent);color:var(--text-on-accent);" } });
 
-				qEl.createDiv({ text: q.number + ". " + q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:6px;" } });
-				if (userAnswer) {
+				qEl.createDiv({ text: "**" + q.number + ".** " + q.text, attr: { style: "font-weight:600;line-height:1.7;font-size:19px;margin-bottom:6px;" } });
+ 				if (userAnswer) {
 					qEl.createDiv({ text: "你的答案：", attr: { style: "font-size:17px;color:var(--text-muted);margin-bottom:2px;" } });
 					qEl.createDiv({ text: userAnswer, attr: { style: "padding:6px 10px;border-radius:4px;background:var(--background-secondary);font-size:19px;line-height:1.7;white-space:pre-wrap;" } });
 				}
@@ -3652,19 +3835,19 @@ class QuestionGeneratorSettingTab extends PluginSettingTab {
 
 		const intervalPresets: Record<string, { label: string; values: string; hint: string }[]> = {
 			wrong: [
-				{ label: "慢速", values: "2,5,10,20,40,60", hint: "首间隔2天，总周期约137天" },
-				{ label: "标准", values: "1,2,4,7,15,30", hint: "首间隔1天，总周期约59天" },
-				{ label: "快速", values: "1,1,2,3,5,7", hint: "首间隔1天，总周期约19天" },
+				{ label: "慢速", values: "2,5,10,20,40,60", hint: "复盘间隔长、执行省心，适合已初步掌握、仅需定期回顾的错题" },
+				{ label: "标准", values: "1,2,4,7,15,30", hint: "考前日常训练主力方案，遗忘曲线与复习节奏平衡" },
+				{ label: "快速", values: "1,1,3,5,10,20", hint: "前期隔天密集复盘，适合频繁出错的高频薄弱点" },
 			],
 			question: [
-				{ label: "慢速", values: "14,30,60,90,120,180", hint: "首间隔14天，总周期约1.7年" },
-				{ label: "标准", values: "7,15,30,60,90", hint: "首间隔7天，总周期约207天" },
-				{ label: "快速", values: "3,5,10,15,30", hint: "首间隔3天，总周期约63天" },
+				{ label: "慢速", values: "10,20,40,80,120", hint: "适合基础扎实、掌握牢固、几乎不会遗忘的简单题目" },
+				{ label: "标准", values: "7,15,30,60,90", hint: "覆盖范围广、周期适中，配合考研各阶段节奏" },
+				{ label: "快速", values: "4,8,18,40,60", hint: "加密前期间隔、反复强化，适合刚学完的重难点" },
 			],
 			note: [
-				{ label: "慢速", values: "3,7,14,30,60,90", hint: "首间隔3天，总周期约204天" },
-				{ label: "标准", values: "1,3,7,14,30", hint: "首间隔1天，总周期约55天" },
-				{ label: "快速", values: "1,1,2,3,5", hint: "首间隔1天，总周期约12天" },
+				{ label: "慢速", values: "3,8,20,45,80", hint: "长线缓释记忆，适合考研基础阶段按部就班的日常背诵" },
+				{ label: "标准", values: "2,6,14,35,70", hint: "中等密度、长线巩固，强化期系统性复习主力配置" },
+				{ label: "快速", values: "1,1,2,3,5", hint: "考前冲刺专用，短期高频轰炸、以速度换覆盖" },
 			],
 		};
 		const intervalConfigs: { label: string; key: "wrongReviewIntervals" | "questionReviewIntervals" | "noteReviewIntervals"; presetKey: string }[] = [
@@ -3679,7 +3862,7 @@ class QuestionGeneratorSettingTab extends PluginSettingTab {
 			const activePreset = currentPreset || presets[1]!;
 			const setting = new Setting(containerEl)
 				.setName(cfg.label)
-				.setDesc(activePreset.hint + "。" + activePreset.range)
+				.setDesc(activePreset.hint)
 				.addText(cb => cb.setValue(currentVal).setPlaceholder("1,2,4,7,15,30").onChange(v => { s[cfg.key] = v; void this.plugin.saveSettings(); }));
 			const btnDiv = setting.settingEl.createDiv({ attr: { style: "display:flex;gap:4px;margin-top:6px;" } });
 			for (const p of presets) {
