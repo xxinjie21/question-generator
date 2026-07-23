@@ -35,6 +35,22 @@ vi.mock("obsidian", () => {
 			constructor() {}
 		},
 		WorkspaceLeaf: class {},
+		PluginSettingTab: class {
+			containerEl = document.createElement("div");
+			constructor(_app: any, _plugin: any) {}
+			display() {}
+		},
+		Setting: class {
+			settingEl = document.createElement("div");
+			constructor(_containerEl: any) {}
+			setName(_name: string) { return this; }
+			setDesc(_desc: string) { return this; }
+			setHeading() { return this; }
+			addText(cb: any) { cb({ setValue: () => ({ setPlaceholder: () => ({ onChange: () => {} }) }), setPlaceholder: () => ({ onChange: () => {} }), onChange: () => {} }); return this; }
+			addToggle(cb: any) { cb({ setValue: () => ({ onChange: () => {} }), onChange: () => {} }); return this; }
+			addDropdown(cb: any) { cb({ addOption: () => ({ addOption: () => ({ setValue: () => ({ onChange: () => {} }) }) }), setValue: () => ({ onChange: () => {} }), onChange: () => {} }); return this; }
+			addButton(cb: any) { cb({ setButtonText: () => ({ onClick: () => {} }) }); return this; }
+		},
 		requestUrl: vi.fn(),
 	};
 });

@@ -6,7 +6,7 @@ import {
 	cleanSourceText,
 	estimateTokens,
 	stripAnswersForExport,
-	sm2Update,
+	reviewUpdate,
 	todayStr,
 	isDueForReview,
 	stripMd,
@@ -85,17 +85,17 @@ describe("stripAnswersForExport", () => {
 	});
 });
 
-describe("sm2Update", () => {
-	it("increases interval on good quality", () => {
-		const result = sm2Update(2.5, 1, 5);
-		expect(result.interval).toBeGreaterThan(1);
-		expect(result.easeFactor).toBeGreaterThan(2.5);
+describe("reviewUpdate", () => {
+	it("increases interval on correct answer", () => {
+		const result = reviewUpdate(0, true);
+		expect(result.correctCount).toBe(1);
+		expect(result.interval).toBeGreaterThan(0);
 	});
 
-	it("resets interval on poor quality", () => {
-		const result = sm2Update(2.5, 10, 1);
+	it("resets to 0 on wrong answer", () => {
+		const result = reviewUpdate(3, false);
+		expect(result.correctCount).toBe(0);
 		expect(result.interval).toBe(1);
-		expect(result.easeFactor).toBeLessThan(2.5);
 	});
 });
 
@@ -110,8 +110,8 @@ describe("isDueForReview", () => {
 		const note = {
 			nextReview: "2020-01-01",
 			interval: 1,
-			easeFactor: 2.5,
-			reviewCount: 0,
+			correctCount: 0,
+			wrongCount: 1,
 		} as any;
 		expect(isDueForReview(note)).toBe(true);
 	});
@@ -120,8 +120,8 @@ describe("isDueForReview", () => {
 		const note = {
 			nextReview: "2099-12-31",
 			interval: 1,
-			easeFactor: 2.5,
-			reviewCount: 0,
+			correctCount: 0,
+			wrongCount: 1,
 		} as any;
 		expect(isDueForReview(note)).toBe(false);
 	});

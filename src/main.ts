@@ -1,4 +1,4 @@
-import { App, Plugin, TFile, TFolder, Notice, ItemView, WorkspaceLeaf, requestUrl, Editor, Menu, MarkdownView, MarkdownFileInfo } from "obsidian";
+import { App, Plugin, PluginSettingTab, Setting, TFile, TFolder, Notice, ItemView, WorkspaceLeaf, requestUrl, Editor, Menu, MarkdownView, MarkdownFileInfo } from "obsidian";
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, UnderlineType } from "docx";
 import * as fs from "fs";
 import * as path from "path";
@@ -28,13 +28,12 @@ interface WrongAnswerNote {
 	sourceFile: string;
 	sourcePath: string;
 	tags: string[];
-	mastered: boolean;
 	resultText: string;
 	note: string;
 	nextReview: string;
 	interval: number;
-	easeFactor: number;
-	reviewCount: number;
+	correctCount: number;
+	wrongCount: number;
 }
 
 type QuestionType = "single" | "multi" | "judge" | "blank" | "essay";
@@ -49,6 +48,7 @@ interface ParsedQuestion {
 }
 
 interface PluginSettings {
+	rootFolder: string;
 	apiType: "ollama" | "openai";
 	baseUrl: string;
 	modelName: string;
@@ -59,7 +59,6 @@ interface PluginSettings {
 	countJudge: number;
 	countBlank: number;
 	countEssay: number;
-	systemPrompt: string;
 	questionFolder: string;
 	wrongBookFolder: string;
 	excludeFolders: string;
@@ -70,9 +69,19 @@ interface PluginSettings {
 	autoReviewReminder: boolean;
 	sortWrongBy: "date" | "tag" | "review";
 	extractedExamFolder: string;
+	wrongReviewIntervals: string;
+	questionReviewIntervals: string;
+	noteReviewIntervals: string;
+	noteViewFolder: string;
+	sortReviewBy: "default" | "source" | "tag" | "time";
+	questionKnowledgeFolder: string;
+	noteKnowledgeFolder: string;
+	wrongKnowledgeFolder: string;
+	customTools: { label: string; url: string }[];
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
+	rootFolder: "智学助手",
 	apiType: "ollama",
 	baseUrl: "http://127.0.0.1:11434",
 	modelName: "qwen2:7b",
@@ -83,9 +92,8 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	countJudge: 5,
 	countBlank: 2,
 	countEssay: 2,
-	systemPrompt: "",
-	questionFolder: "出题",
-	wrongBookFolder: "错题本",
+	questionFolder: "题目",
+	wrongBookFolder: "错题",
 	excludeFolders: ".trash, 模板, templates",
 	autoSave: true,
 	lastTags: "",
@@ -93,19 +101,31 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	weakPointThreshold: 2,
 	autoReviewReminder: true,
 	sortWrongBy: "date",
-	extractedExamFolder: "出题/识别试卷",
+	extractedExamFolder: "题目/识别试卷",
+	wrongReviewIntervals: "1,2,4,7,15,30",
+	questionReviewIntervals: "7,15,30,60,90",
+	noteReviewIntervals: "1,3,7,14,30",
+	noteViewFolder: "笔记",
+	sortReviewBy: "default",
+	questionKnowledgeFolder: "题目/知识点",
+	noteKnowledgeFolder: "笔记/知识点",
+	wrongKnowledgeFolder: "错题/知识点",
+	customTools: [
+		{ label: "Word/Excel转Markdown", url: "https://www.word2md.net/zh" },
+	],
 };
 
-const SYSTEM_TAGS = ["错题", "已掌握", "题目"];
+const SYSTEM_TAGS = ["错题", "题目"];
 
 // ===================== 常量定义 =====================
-const MAX_EXAM_CONTENT_CHARS = 15000;
+const MAX_EXAM_CHUNK_CHARS = 15000;
+const EXAM_CHUNK_OVERLAP = 2000;
 const MAX_EXTRACTED_TAGS = 8;
 const MAX_WEAK_POINTS_DISPLAY = 8;
 const MAX_UNTAGGED_DISPLAY = 10;
-const MAX_MASTERED_DISPLAY = 10;
 const MAX_REPORT_SNIPPET = 200;
 const MAX_HISTORY_SNIPPET = 500;
+const MAX_RECENT_WRONG_DISPLAY = 5;
 const AI_REQUEST_TIMEOUT_MS = 180000;
 const TOKEN_WARN_THRESHOLD = 6000;
 const NOTICE_DURATION_MS = 8000;
@@ -220,6 +240,12 @@ function isAbs(p: string): boolean {
 	return /^[A-Za-z]:[/\\]/.test(p) || p.startsWith("/");
 }
 
+function daysUntil(dateStr: string): number {
+	const today = new Date().toISOString().slice(0, 10);
+	const diff = new Date(dateStr).getTime() - new Date(today).getTime();
+	return Math.max(0, Math.ceil(diff / 86400000));
+}
+
 function ensureFolderAbs(dir: string) {
 	if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
@@ -281,7 +307,8 @@ export function cleanSourceText(text: string): string {
 export function estimateTokens(text: string): number {
 	let count = 0;
 	for (let i = 0; i < text.length; i++) {
-		const code = text.charCodeAt(i);
+		const code = text.codePointAt(i)!;
+		if (code > 0xFFFF) i++;
 		count += (code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) || (code >= 0x20000 && code <= 0x2A6DF) ? 1.5 : 1;
 	}
 	return Math.ceil(count);
@@ -309,34 +336,21 @@ export function stripAnswersForExport(text: string): string {
 	return result.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// ===================== 间隔重复 (SM-2) =====================
-export function sm2Update(easeFactor: number, interval: number, quality: number): { easeFactor: number; interval: number; nextReview: string } {
-	// quality: 0=again, 1=hard, 2=good, 3=easy
-	let newEF = easeFactor + (0.1 - (3 - quality) * (0.08 + (3 - quality) * 0.02));
-	if (newEF < 1.3) newEF = 1.3;
-	if (newEF > 3.0) newEF = 3.0;
-
-	let newInterval: number;
-	if (quality <= 1) {
-		newInterval = 1; // Again/Hard → 1 day
-	} else if (quality === 2) {
-		if (interval <= 1) newInterval = 3;
-		else if (interval <= 7) newInterval = 7;
-		else newInterval = Math.round(interval * newEF);
-	} else {
-		// Easy
-		if (interval <= 1) newInterval = 7;
-		else if (interval <= 7) newInterval = 14;
-		else newInterval = Math.round(interval * newEF * 1.3);
-	}
-
+// ===================== 间隔重复 (对错计数) =====================
+const DEFAULT_WRONG_INTERVALS = [1, 2, 4, 7, 15, 30];
+const DEFAULT_QUESTION_INTERVALS = [7, 15, 30, 60, 90];
+function parseReviewIntervals(s: string, fallback: number[]): number[] {
+	const nums = s.split(",").map(v => parseInt(v.trim())).filter(v => v > 0);
+	return nums.length > 0 ? nums : fallback;
+}
+export function reviewUpdate(correctCount: number, wasCorrect: boolean, intervals?: number[]): { correctCount: number; interval: number; nextReview: string } {
+	const ivls = intervals || DEFAULT_WRONG_INTERVALS;
+	let newCorrect = wasCorrect ? correctCount + 1 : 0;
+	const idx = Math.min(newCorrect, ivls.length - 1);
+	const newInterval = ivls[idx]!;
 	const nextDate = new Date();
 	nextDate.setDate(nextDate.getDate() + newInterval);
-	return {
-		easeFactor: Math.round(newEF * 100) / 100,
-		interval: newInterval,
-		nextReview: nextDate.toISOString().slice(0, 10)
-	};
+	return { correctCount: newCorrect, interval: newInterval, nextReview: nextDate.toISOString().slice(0, 10) };
 }
 
 export function todayStr(): string {
@@ -344,7 +358,6 @@ export function todayStr(): string {
 }
 
 export function isDueForReview(note: WrongAnswerNote): boolean {
-	if (note.mastered) return false;
 	if (!note.nextReview) return false;
 	return note.nextReview <= todayStr();
 }
@@ -957,10 +970,13 @@ async function exportPdfDirect(filePath: string, text: string, title?: string, s
 	
 	const { BrowserWindow } = getElectronRemote();
 	const win = new BrowserWindow({ show: false, width: 900, height: 1200, webPreferences: { offscreen: true } });
-	await win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(fullHtml));
-	const pdfData = await win.webContents.printToPDF({ printBackground: true, pageSize: "A4", marginTop: 0.6, marginBottom: 0.6, marginLeft: 0.5, marginRight: 0.5 });
-	fs.writeFileSync(filePath, pdfData);
-	win.close();
+	try {
+		await win.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(fullHtml));
+		const pdfData = await win.webContents.printToPDF({ printBackground: true, pageSize: "A4", marginTop: 0.6, marginBottom: 0.6, marginLeft: 0.5, marginRight: 0.5 });
+		fs.writeFileSync(filePath, pdfData);
+	} finally {
+		win.close();
+	}
 }
 
 // ===================== 主插件入口 =====================
@@ -968,13 +984,13 @@ const SIDEBAR_VIEW_TYPE = "question-generator-sidebar";
 
 class MainSidebarView extends ItemView {
 	plugin: QuestionGeneratorPlugin;
-	activeSection: "home" | "wrong" | "analytics" | "settings" = "home";
+	activeSection: "home" | "questions" | "notes" | "wrong" | "review" | "settings" = "home";
 	innerContentEl: HTMLDivElement | null = null;
 	navButtons: Map<string, HTMLDivElement> = new Map();
 	private _refreshHandler: (() => void) | null = null;
 
 	// Home sub-views
-	homeView: "default" | "filePicker" | "generate" | "answer" | "examBrowser" = "default";
+	homeView: "default" | "filePicker" | "generate" | "answer" | "examBrowser" | "tagger" = "default";
 
 	// File picker state
 	fpSelected: Set<string> = new Set();
@@ -1012,8 +1028,18 @@ class MainSidebarView extends ItemView {
 	wrongNotes: WrongAnswerNote[] = [];
 	wrongCurrentNote: WrongAnswerNote | null = null;
 	wrongSelectedBatch: Set<string> = new Set();
-	wrongSortMode: "tag" | "default" | "date" | "source" = "tag";
+	wrongSortMode: "default" | "source" | "tag" | "time" = "default";
 	questionFileSortMode: "tag" | "default" | "date" = "tag";
+	questionsSortMode: "default" | "source" | "tag" | "time" = "default";
+	notesSortMode: "default" | "source" | "tag" | "time" = "default";
+	notePickerActive = false;
+	reviewSortBy: "default" | "source" | "tag" | "time" = "default";
+	reviewFilterType: "all" | "wrong" | "question" | "note" = "all";
+
+	// Tagger state
+	taggerMode: "current" | "folder" = "current";
+	taggerProcessing = false;
+	taggerStatusText = "";
 
 	getViewType() { return SIDEBAR_VIEW_TYPE; }
 	getDisplayText() { return "智学助手"; }
@@ -1047,15 +1073,17 @@ class MainSidebarView extends ItemView {
 		header.createDiv({ text: "智学助手", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:8px;" } });
 
 		const nav = container.createDiv({ attr: { style: "display:flex;gap:2px;padding:4px;background:var(--background-secondary);border-radius:6px;margin-bottom:10px;" } });
-		const navItems: { key: "home" | "wrong" | "analytics" | "settings"; label: string; icon: string }[] = [
+		const navItems: { key: "home" | "questions" | "notes" | "wrong" | "review" | "settings"; label: string; icon: string }[] = [
 			{ key: "home", label: "首页", icon: "🏠" },
-			{ key: "wrong", label: "错题本", icon: "❌" },
-			{ key: "analytics", label: "分析", icon: "📊" },
+			{ key: "questions", label: "题目", icon: "📝" },
+			{ key: "notes", label: "笔记", icon: "📋" },
+			{ key: "wrong", label: "错题", icon: "❌" },
+			{ key: "review", label: "复习", icon: "📊" },
 			{ key: "settings", label: "设置", icon: "⚙️" },
 		];
 		this.navButtons.clear();
 		for (const item of navItems) {
-			const btn = nav.createDiv({ attr: { style: "flex:1;text-align:center;padding:6px 0;border-radius:4px;cursor:pointer;font-size:18px;transition:background 0.15s;" + (this.activeSection === item.key ? "background:var(--background-modifier-hover);font-weight:600;" : "") } });
+			const btn = nav.createDiv({ attr: { style: "flex:1;text-align:center;padding:5px 0;border-radius:4px;cursor:pointer;font-size:16px;transition:background 0.15s;" + (this.activeSection === item.key ? "background:var(--background-modifier-hover);font-weight:600;" : "") } });
 			btn.setText(item.icon + " " + item.label);
 			btn.addEventListener("click", () => {
 				this.activeSection = item.key;
@@ -1070,8 +1098,10 @@ class MainSidebarView extends ItemView {
 
 		switch (this.activeSection) {
 			case "home": await this.renderHomeTab(); break;
+			case "questions": await this.renderQuestionsTab(); break;
+			case "notes": await this.renderNotesTab(); break;
 			case "wrong": await this.renderWrongTab(); break;
-			case "analytics": await this.renderAnalyticsTab(); break;
+			case "review": await this.renderReviewTab(); break;
 			case "settings": this.renderSettingsTab(); break;
 		}
 	}
@@ -1085,6 +1115,7 @@ class MainSidebarView extends ItemView {
 			case "generate": this.renderGenerateView(); break;
 			case "answer": this.renderAnswerView(); break;
 			case "examBrowser": await this.renderExamBrowser(); break;
+			case "tagger": await this.renderTaggerView(); break;
 		}
 	}
 
@@ -1102,20 +1133,24 @@ class MainSidebarView extends ItemView {
 			c.createDiv({ text: label, attr: { style: "color:var(--text-muted);font-size:17px;margin-top:2px;" } });
 			return c;
 		};
-		const dueCard = miniCard("待复习", String(stats.dueCount), stats.dueCount > 0 ? "var(--interactive-accent)" : undefined);
-		dueCard.addEventListener("click", () => { this.activeSection = "wrong"; this.wrongView = "list"; void this.render(); });
-		miniCard("错题总数", String(stats.totalWrong));
-		miniCard("已掌握", String(stats.mastered), stats.mastered > 0 ? "var(--color-green)" : undefined);
-		miniCard("出题次数", String(stats.totalGenerated));
+		const qCard = miniCard("题目", String(stats.questionCount), stats.questionCount > 0 ? "var(--interactive-accent)" : undefined);
+		qCard.addEventListener("click", () => { this.activeSection = "questions"; void this.render(); });
+		const nCard = miniCard("笔记", String(stats.noteCount), stats.noteCount > 0 ? "var(--color-green)" : undefined);
+		nCard.addEventListener("click", () => { this.activeSection = "notes"; void this.render(); });
+		const dueCard = miniCard("待复习", String(stats.dueCount), stats.dueCount > 0 ? "var(--color-orange)" : undefined);
+		dueCard.addEventListener("click", () => { this.activeSection = "review"; void this.render(); });
+		const wCard = miniCard("错题", String(stats.totalWrong), stats.totalWrong > 0 ? "var(--color-red)" : undefined);
+		wCard.addEventListener("click", () => { this.activeSection = "wrong"; this.wrongView = "list"; void this.render(); });
 
 		const actSection = el.createDiv({ attr: { style: "margin-bottom:14px;" } });
 		actSection.createDiv({ text: "快捷操作", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;" } });
 
 		const actions = [
-			{ label: "📝 当前文档出题", desc: "基于当前打开的文档", action: () => this.openCurrentFileGenerate() },
-			{ label: "📂 选择文件出题", desc: "从知识库选择文件", action: () => { this.homeView = "filePicker"; void this.renderHomeTab(); } },
-			{ label: "🎯 薄弱点出题", desc: "针对薄弱知识点", badge: stats.weakCount > 0 ? String(stats.weakCount) : undefined, action: async () => { await this.generateFromWeakPoints(); } },
+			{ label: "📝 当前文档生成题目", desc: "基于当前打开的文档", action: () => this.openCurrentFileGenerate() },
+			{ label: "📂 选择文件生成题目", desc: "从知识库选择文件", action: () => { this.homeView = "filePicker"; void this.renderHomeTab(); } },
+			{ label: "🎯 薄弱点生成题目", desc: "针对薄弱知识点", badge: stats.weakCount > 0 ? String(stats.weakCount) : undefined, action: async () => { await this.generateFromWeakPoints(); } },
 			{ label: "📋 AI识别试卷", desc: "从文档中AI提取题目并答题", action: () => { this.homeView = "examBrowser"; void this.renderHomeTab(); } },
+			{ label: "🏷️ AI添加标签", desc: "AI识别知识点并写入frontmatter，用于知识图谱", action: () => { this.taggerMode = "current"; this.fpSelected.clear(); this.homeView = "tagger"; void this.renderHomeTab(); } },
 		];
 		for (const act of actions) {
 			const row = el.createDiv({ cls: "qg-action-row" });
@@ -1137,30 +1172,47 @@ class MainSidebarView extends ItemView {
 			if (stats.dueCount > 3) reviewSection.createDiv({ text: "还有" + (stats.dueCount - 3) + "题...", attr: { style: "font-size:17px;color:var(--text-muted);padding-top:4px;" } });
 		}
 
-		await this.renderQuestionFiles(el);
+		const toolsSection = el.createDiv({ attr: { style: "margin-top:10px;" } });
+		toolsSection.createDiv({ text: "实用工具", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;" } });
+		for (const tool of this.plugin.settings.customTools) {
+			const toolRow = toolsSection.createDiv({ cls: "qg-action-row" });
+			toolRow.createSpan({ text: "🔗 " + tool.label, cls: "qg-action-label" });
+			toolRow.createSpan({ text: "外部", attr: { style: "font-size:14px;color:var(--text-muted);padding:1px 6px;border-radius:3px;border:1px solid var(--background-modifier-border);margin-left:4px;" } });
+			toolRow.addEventListener("click", () => { window.open(tool.url, "_blank"); });
+		}
 	}
 
-	async renderQuestionFiles(el: HTMLElement) {
-		const folder = this.plugin.settings.questionFolder;
-		if (!folder) return;
+	// ===================== QUESTIONS TAB =====================
+	async listQuestionFiles(folder: string): Promise<TFile[]> {
+		if (isAbs(folder)) {
+			try {
+				if (!fs.existsSync(folder)) return [];
+				const files = fs.readdirSync(folder).filter((f: string) => f.endsWith(".md"));
+				return files.map((f: string) => {
+					const fp = path.join(folder, f);
+					const stat = fs.statSync(fp);
+					return { name: f, path: fp, basename: f.replace(/\.md$/, ""), stat: { mtime: stat.mtimeMs, size: stat.size } } as unknown as TFile;
+				}).sort((a: TFile, b: TFile) => (b.stat.mtime || 0) - (a.stat.mtime || 0));
+			} catch { return []; }
+		}
+		try {
+			const tfolder = this.app.vault.getAbstractFileByPath(folder);
+			if (!tfolder || !(tfolder instanceof TFolder)) return [];
+			return (tfolder.children as TFile[]).filter(f => f instanceof TFile && f.name.endsWith(".md")).sort((a, b) => (b.stat.mtime || 0) - (a.stat.mtime || 0));
+		} catch { return []; }
+	}
+
+	async renderQuestionsTab() {
+		if (!this.innerContentEl) return;
+		const el = this.innerContentEl;
+		el.empty();
+
+		const folder = this.plugin.rootPath(this.plugin.settings.questionFolder);
+		if (!folder) { el.createDiv({ text: "请在设置中配置题目文件夹", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } }); return; }
+
 		const files = await this.listQuestionFiles(folder);
-		const section = el.createDiv({});
-		const headerRow = section.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px;" } });
-		headerRow.createDiv({ text: "出题文件 (" + files.length + ")", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;flex:1;" } });
-		const modeBar = headerRow.createDiv({ attr: { style: "display:flex;gap:2px;" } });
-		const sortModes: { key: "tag" | "default" | "date"; label: string }[] = [
-			{ key: "tag", label: "按知识点" },
-			{ key: "default", label: "默认" },
-			{ key: "date", label: "按时间" },
-		];
-		for (const m of sortModes) {
-			const mb = modeBar.createEl("button", { text: m.label, attr: { style: "padding:2px 6px;border-radius:3px;cursor:pointer;font-size:16px;border:1px solid var(--background-modifier-border);background:" + (this.questionFileSortMode === m.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
-			mb.addEventListener("click", () => { this.questionFileSortMode = m.key; void this.renderHomeTab(); });
-		}
-		if (files.length === 0) {
-			section.createDiv({ text: "暂无出题文件", attr: { style: "color:var(--text-faint);font-size:18px;text-align:center;padding:12px 0;" } });
-			return;
-		}
+
+		const allTags = new Set<string>();
 		const fileData: { file: TFile; tags: string[] }[] = [];
 		for (const file of files) {
 			try {
@@ -1172,118 +1224,162 @@ class MainSidebarView extends ItemView {
 					const tagMatch = fmMatch[1]!.match(/tags:\s*\[([^\]]*)\]/);
 					if (tagMatch) tags = tagMatch[1]!.split(",").map(s => s.trim()).filter(Boolean);
 				}
+				const kp = knowledgeTags(tags);
+				kp.forEach(t => allTags.add(t));
 				fileData.push({ file, tags });
 			} catch { fileData.push({ file, tags: [] }); }
 		}
 
-		const tagGroups: Record<string, { file: TFile; tags: string[] }[]> = {};
-		const untagged: { file: TFile; tags: string[] }[] = [];
-		for (const fd of fileData) {
-			const kp = knowledgeTags(fd.tags);
-			if (kp.length === 0) { untagged.push(fd); continue; }
-			for (const t of kp) {
-				if (!tagGroups[t]) tagGroups[t] = [];
-				tagGroups[t].push(fd);
-			}
+		const statsRow = el.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:10px;font-size:18px;" } });
+		statsRow.createSpan({ text: "题目 " + files.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--interactive-accent) 15%, transparent);color:var(--interactive-accent);font-weight:600;" } });
+		statsRow.createSpan({ text: "知识点 " + allTags.size, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-green) 15%, transparent);color:var(--color-green);font-weight:600;" } });
+
+		const sortBar = el.createDiv({ attr: { style: "display:flex;gap:2px;margin-bottom:10px;" } });
+		const sortModes: { key: "default" | "source" | "tag" | "time"; label: string }[] = [
+			{ key: "default", label: "默认" },
+			{ key: "source", label: "按源文件" },
+			{ key: "tag", label: "按知识点" },
+			{ key: "time", label: "按时间" },
+		];
+		for (const m of sortModes) {
+			const mb = sortBar.createEl("button", { text: m.label, attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.questionsSortMode === m.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
+			mb.addEventListener("click", () => { this.questionsSortMode = m.key; void this.renderQuestionsTab(); });
 		}
-		const sortedTags = Object.entries(tagGroups).sort((a, b) => b[1].length - a[1].length);
 
-		const searchEl = section.createEl("input", { attr: { type: "text", placeholder: "搜索文件名...", style: "width:100%;padding:5px 8px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;margin-bottom:8px;" } });
-		const listEl = section.createDiv({});
+		if (files.length === 0) {
+			el.createDiv({ text: "暂无题目文件", attr: { style: "color:var(--text-faint);text-align:center;padding:20px 0;font-size:19px;" } });
+			return;
+		}
 
-		const renderFileItem = (container: HTMLElement, fd: { file: TFile; tags: string[] }) => {
-			const file = fd.file;
-			const item = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:4px;padding:6px 4px;border-bottom:1px solid var(--background-modifier-border);font-size:18px;" } });
-			const nameEl = item.createSpan({ text: file.name, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;cursor:pointer;" } });
-			nameEl.addEventListener("click", () => { void this.app.workspace.openLinkText(file.path, "", false); });
-			const kp = knowledgeTags(fd.tags);
-			if (kp.length > 0) item.createSpan({ text: "#" + kp[0], cls: "qg-file-tag" });
-			item.createSpan({ text: Math.round(file.stat.size / 1024) + "KB", cls: "qg-file-size" });
-			const d = new Date(file.stat.mtime);
-			item.createSpan({ text: (d.getMonth() + 1) + "/" + d.getDate(), cls: "qg-file-date" });
-			const actRow = item.createDiv({ cls: "qg-file-actions" });
-			const actBtn = (label: string, tip: string, cb: () => void) => {
-				const b = actRow.createSpan({ text: label, attr: { title: tip }, cls: "qg-file-btn" });
-				b.addEventListener("click", (e) => { e.stopPropagation(); cb(); });
-			};
-			actBtn("📖", "在Obsidian中打开", () => { void this.app.workspace.openLinkText(file.path, "", false).catch(() => {}); });
-			actBtn("✏️", "答题", () => {
-				void (async () => {
-					const content = isAbs(folder) ? readFileStr(file.path) : await this.app.vault.read(file);
-					const clean = content.replace(/^---[\s\S]*?---\s*/, "");
-					this.startAnswer(clean, file.basename, file.path);
-				})();
-			});
-			actBtn("📤", "导出", () => {
-				void (async () => {
-					const content = isAbs(folder) ? readFileStr(file.path) : await this.app.vault.read(file);
-					const clean = content.replace(/^---[\s\S]*?---\s*/, "");
-					const baseName = file.basename.replace(/_试题.*$/, "");
-					
-					const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: file.basename + ".docx", filters: [{ name: "Word", extensions: ["docx"] }, { name: "PDF", extensions: ["pdf"] }, { name: "Markdown", extensions: ["md"] }] });
-					if (r.canceled || !r.filePath) return;
-					const fp = r.filePath;
-					if (fp.endsWith(".docx")) {
-						const children = buildWordParagraphs(clean, baseName + " 配套试题", baseName);
-						const doc = new Document({ sections: [{ properties: {}, children }] });
-						const buffer = await Packer.toBuffer(doc);
-						fs.writeFileSync(fp, Buffer.from(buffer));
-						new Notice("Word已保存");
-					} else if (fp.endsWith(".pdf")) {
-						await exportPdfDirect(fp, clean, baseName + " 配套试题", baseName);
-						new Notice("PDF已保存");
-					} else {
-						fs.writeFileSync(fp, clean, "utf-8");
-						new Notice("Md已保存");
-					}
-				})();
-			});
-			actBtn("✏", "重命名", () => {
-				void (async () => {
-					const newName = prompt("输入新文件名（不含扩展号）：", file.basename);
-					if (!newName || newName === file.basename) return;
-					try {
-						if (isAbs(folder)) {
-							const ext = file.name.endsWith(".md") ? ".md" : "";
-							fs.renameSync(file.path, folder + "\\" + newName + ext);
-						} else {
-							await this.app.fileManager.renameFile(file, folder + "/" + newName + ".md");
-						}
-						new Notice("已重命名");
-						void this.render();
-					} catch (err) { new Notice("重命名失败：" + (err as Error).message); }
-				})();
-			});
-			actBtn("🗑", "删除", () => {
-				void (async () => {
-					if (!confirm("确定删除 " + file.name + "？")) return;
-					try {
-						if (isAbs(folder)) { deleteFileAbs(file.path); } else { await this.app.fileManager.trashFile(file); }
-						new Notice("已删除");
-						void this.render();
-					} catch (err) { new Notice("删除失败：" + (err as Error).message); }
-				})();
-			});
-			item.addEventListener("mouseenter", () => item.setCssProps({ background: "var(--background-modifier-hover)" }));
-			item.addEventListener("mouseleave", () => item.setCssProps({ background: "" }));
-		};
+		const searchEl = el.createEl("input", { attr: { type: "text", placeholder: "搜索文件名...", style: "width:100%;padding:5px 8px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;margin-bottom:8px;" } });
+		const listEl = el.createDiv({});
 
 		const renderList = (query: string) => {
 			listEl.empty();
-			const filtered = query ? fileData.filter(fd => fd.file.name.toLowerCase().includes(query.toLowerCase())) : fileData;
-			if (filtered.length === 0) { listEl.createDiv({ text: "无匹配文件", attr: { style: "color:var(--text-muted);text-align:center;padding:8px;font-size:18px;" } }); return; }
-			if (query || this.questionFileSortMode === "default") {
+			const q = query.toLowerCase();
+			const filtered = q ? fileData.filter(fd => fd.file.name.toLowerCase().includes(q) || fd.file.basename.toLowerCase().includes(q)) : fileData;
+
+			const renderFileItem = (container: HTMLElement, fd: { file: TFile; tags: string[] }) => {
+				const file = fd.file;
+				const item = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:4px;padding:6px 4px;border-bottom:1px solid var(--background-modifier-border);font-size:18px;cursor:pointer;transition:background 0.15s;" } });
+				item.classList.add("qg-hover-bg");
+				const nameEl = item.createSpan({ text: file.name, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--interactive-accent);" } });
+				nameEl.addEventListener("click", () => { void this.app.workspace.openLinkText(file.path, "", false); });
+				const kp = knowledgeTags(fd.tags);
+				if (kp.length > 0) item.createSpan({ text: "#" + kp[0], attr: { style: "font-size:16px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80px;" } });
+				item.createSpan({ text: Math.round(file.stat.size / 1024) + "KB", attr: { style: "font-size:16px;color:var(--text-muted);" } });
+				const d = new Date(file.stat.mtime);
+				item.createSpan({ text: (d.getMonth() + 1) + "/" + d.getDate(), attr: { style: "font-size:16px;color:var(--text-muted);" } });
+				const actRow = item.createDiv({ attr: { style: "display:flex;gap:2px;flex-shrink:0;" } });
+				const actBtn = (label: string, tip: string, cb: () => void) => {
+					const b = actRow.createSpan({ text: label, attr: { title: tip, style: "padding:1px 4px;border-radius:3px;cursor:pointer;font-size:16px;" } });
+					b.addEventListener("click", (e) => { e.stopPropagation(); cb(); });
+				};
+				actBtn("📖", "打开", () => { void this.app.workspace.openLinkText(file.path, "", false).catch(() => {}); });
+				actBtn("✏️", "答题", () => {
+					void (async () => {
+						const content = isAbs(folder) ? readFileStr(file.path) : await this.app.vault.read(file);
+						const clean = content.replace(/^---[\s\S]*?---\s*/, "");
+						this.startAnswer(clean, file.basename, file.path);
+					})();
+				});
+				actBtn("📤", "导出", () => {
+					void (async () => {
+						const content = isAbs(folder) ? readFileStr(file.path) : await this.app.vault.read(file);
+						const clean = content.replace(/^---[\s\S]*?---\s*/, "");
+						const baseName = file.basename.replace(/_试题.*$/, "");
+						const r = await getElectronRemote().dialog.showSaveDialog({ defaultPath: file.basename + ".docx", filters: [{ name: "Word", extensions: ["docx"] }, { name: "PDF", extensions: ["pdf"] }, { name: "Markdown", extensions: ["md"] }] });
+						if (r.canceled || !r.filePath) return;
+						const fp = r.filePath;
+						if (fp.endsWith(".docx")) {
+							const children = buildWordParagraphs(clean, baseName + " 配套试题", baseName);
+							const doc = new Document({ sections: [{ properties: {}, children }] });
+							const buffer = await Packer.toBuffer(doc);
+							fs.writeFileSync(fp, Buffer.from(buffer));
+							new Notice("Word已保存");
+						} else if (fp.endsWith(".pdf")) {
+							await exportPdfDirect(fp, clean, baseName + " 配套试题", baseName);
+							new Notice("PDF已保存");
+						} else {
+							fs.writeFileSync(fp, clean, "utf-8");
+							new Notice("Md已保存");
+						}
+					})();
+				});
+				actBtn("✏", "重命名", () => {
+					void (async () => {
+						const newName = prompt("输入新文件名（不含扩展号）：", file.basename);
+						if (!newName || newName === file.basename) return;
+						try {
+							if (isAbs(folder)) {
+								const ext = file.name.endsWith(".md") ? ".md" : "";
+								fs.renameSync(file.path, folder + "\\" + newName + ext);
+							} else {
+								const newPath = file.path.replace(/[^/]+$/, newName + ".md");
+								await this.app.vault.rename(file, newPath);
+							}
+							new Notice("已重命名");
+							void this.renderQuestionsTab();
+						} catch (err) { new Notice("重命名失败：" + (err as Error).message); }
+					})();
+				});
+				actBtn("🗑", "删除", () => {
+					void (async () => {
+						if (!confirm("确定删除题目文件「" + file.basename + "」？")) return;
+						try {
+							if (isAbs(folder)) { fs.unlinkSync(file.path); } else { await this.app.fileManager.trashFile(file); }
+							new Notice("已删除");
+							void this.renderQuestionsTab();
+						} catch (err) { new Notice("删除失败：" + (err as Error).message); }
+					})();
+				});
+			};
+
+			if (this.questionsSortMode === "default") {
 				for (const fd of filtered) renderFileItem(listEl, fd);
-			} else if (this.questionFileSortMode === "date") {
-				const sorted = [...filtered].sort((a, b) => (b.file.stat.mtime || 0) - (a.file.stat.mtime || 0));
-				for (const fd of sorted) renderFileItem(listEl, fd);
-			} else {
+			} else if (this.questionsSortMode === "source") {
+				const groups: Record<string, { file: TFile; tags: string[] }[]> = {};
+				const noSource: { file: TFile; tags: string[] }[] = [];
+				for (const fd of filtered) {
+					const src = fd.file.basename.replace(/_试题.*$/, "");
+					if (!src) { noSource.push(fd); continue; }
+					const arr = groups[src] || (groups[src] = []);
+					arr.push(fd);
+				}
+				const sorted = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+				for (const [src, srcFiles] of sorted) {
+					const group = listEl.createDiv({ attr: { style: "margin-bottom:8px;border:1px solid var(--background-modifier-border);border-radius:6px;overflow:hidden;" } });
+					const header = group.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;background:var(--background-secondary);" } });
+					const arrow = header.createSpan({ text: "▸", attr: { style: "font-size:17px;color:var(--text-muted);min-width:14px;" } });
+					header.createSpan({ text: src, attr: { style: "font-weight:600;font-size:18px;color:var(--interactive-accent);flex:1;" } });
+					header.createSpan({ text: srcFiles.length + "题", attr: { style: "font-size:17px;color:var(--text-muted);" } });
+					const list = group.createDiv({ attr: { style: "display:none;padding:4px 8px;" } });
+					for (const fd of srcFiles) renderFileItem(list, fd);
+					let expanded = false;
+					header.addEventListener("click", () => { expanded = !expanded; list.style.display = expanded ? "block" : "none"; arrow.setText(expanded ? "▾" : "▸"); });
+				}
+				if (noSource.length > 0) {
+					listEl.createDiv({ text: "未分类", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin:10px 0 6px;" } });
+					for (const fd of noSource) renderFileItem(listEl, fd);
+				}
+			} else if (this.questionsSortMode === "tag") {
+				const tagGroups: Record<string, { file: TFile; tags: string[] }[]> = {};
+				const untagged: { file: TFile; tags: string[] }[] = [];
+				for (const fd of filtered) {
+					const kp = knowledgeTags(fd.tags);
+					if (kp.length === 0) { untagged.push(fd); continue; }
+					for (const t of kp) {
+						const arr = tagGroups[t] || (tagGroups[t] = []);
+						arr.push(fd);
+					}
+				}
+				const sortedTags = Object.entries(tagGroups).sort((a, b) => b[1].length - a[1].length);
 				for (const [tag, tagFiles] of sortedTags) {
 					const group = listEl.createDiv({ attr: { style: "margin-bottom:8px;border:1px solid var(--background-modifier-border);border-radius:6px;overflow:hidden;" } });
 					const header = group.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;background:var(--background-secondary);" } });
 					const arrow = header.createSpan({ text: "▸", attr: { style: "font-size:17px;color:var(--text-muted);min-width:14px;" } });
 					header.createSpan({ text: "#" + tag, attr: { style: "font-weight:600;font-size:18px;color:var(--interactive-accent);flex:1;" } });
-					header.createSpan({ text: tagFiles.length + "个", attr: { style: "font-size:17px;color:var(--text-muted);" } });
+					header.createSpan({ text: tagFiles.length + "题", attr: { style: "font-size:17px;color:var(--text-muted);" } });
 					const list = group.createDiv({ attr: { style: "display:none;padding:4px 8px;" } });
 					for (const fd of tagFiles) renderFileItem(list, fd);
 					let expanded = false;
@@ -1293,13 +1389,233 @@ class MainSidebarView extends ItemView {
 					listEl.createDiv({ text: "未分类", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin:10px 0 6px;" } });
 					for (const fd of untagged) renderFileItem(listEl, fd);
 				}
+			} else if (this.questionsSortMode === "time") {
+				const sorted = [...filtered].sort((a, b) => (b.file.stat.mtime || 0) - (a.file.stat.mtime || 0));
+				for (const fd of sorted) renderFileItem(listEl, fd);
 			}
 		};
 		searchEl.addEventListener("input", debounce(() => renderList(searchEl.value), SEARCH_DEBOUNCE_MS));
 		renderList("");
 	}
 
-	async listQuestionFiles(folder: string): Promise<TFile[]> {
+	// ===================== NOTES TAB =====================
+	async renderNotesTab() {
+		if (!this.innerContentEl) return;
+		const el = this.innerContentEl;
+		el.empty();
+
+		if (this.notePickerActive) {
+			this.renderNotePicker(el);
+			return;
+		}
+
+		const folder = this.plugin.rootPath(this.plugin.settings.noteViewFolder);
+		if (!folder) { el.createDiv({ text: "请在设置中配置笔记文件夹", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } }); return; }
+
+		const files = await this.listNoteViewFiles(folder);
+
+		const allTags = new Set<string>();
+		const fileData: { file: TFile; tags: string[] }[] = [];
+		for (const file of files) {
+			try {
+				let content = "";
+				if (isAbs(folder)) { content = readFileStr(file.path); } else { content = await this.app.vault.read(file); }
+				const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+				let tags: string[] = [];
+				if (fmMatch) {
+					const tagMatch = fmMatch[1]!.match(/tags:\s*\[([^\]]*)\]/);
+					if (tagMatch) tags = tagMatch[1]!.split(",").map(s => s.trim()).filter(Boolean);
+				}
+				const kp = knowledgeTags(tags);
+				kp.forEach(t => allTags.add(t));
+				fileData.push({ file, tags });
+			} catch { fileData.push({ file, tags: [] }); }
+		}
+
+		const statsRow = el.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:10px;font-size:18px;" } });
+		statsRow.createSpan({ text: "笔记 " + files.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-green) 15%, transparent);color:var(--color-green);font-weight:600;" } });
+		statsRow.createSpan({ text: "知识点 " + allTags.size, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--interactive-accent) 15%, transparent);color:var(--interactive-accent);font-weight:600;" } });
+
+		const actionRow = el.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:10px;" } });
+		const createBtn = actionRow.createEl("button", { text: "从文件创建笔记", attr: { style: "padding:5px 12px;border-radius:4px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
+		createBtn.addEventListener("click", () => { this.notePickerActive = true; void this.renderNotesTab(); });
+
+		const sortBar = el.createDiv({ attr: { style: "display:flex;gap:2px;margin-bottom:10px;" } });
+		const sortModes: { key: "default" | "source" | "tag" | "time"; label: string }[] = [
+			{ key: "default", label: "默认" },
+			{ key: "source", label: "按源文件" },
+			{ key: "tag", label: "按知识点" },
+			{ key: "time", label: "按时间" },
+		];
+		for (const m of sortModes) {
+			const mb = sortBar.createEl("button", { text: m.label, attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.notesSortMode === m.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
+			mb.addEventListener("click", () => { this.notesSortMode = m.key; void this.renderNotesTab(); });
+		}
+
+		if (files.length === 0) {
+			el.createDiv({ text: "暂无笔记文件", attr: { style: "color:var(--text-faint);text-align:center;padding:20px 0;font-size:19px;" } });
+			return;
+		}
+
+		const searchEl = el.createEl("input", { attr: { type: "text", placeholder: "搜索文件名...", style: "width:100%;padding:5px 8px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;margin-bottom:8px;" } });
+		const listEl = el.createDiv({});
+
+		const renderList = (query: string) => {
+			listEl.empty();
+			const q = query.toLowerCase();
+			const filtered = q ? fileData.filter(fd => fd.file.name.toLowerCase().includes(q) || fd.file.basename.toLowerCase().includes(q)) : fileData;
+
+			const renderFileItem = (container: HTMLElement, fd: { file: TFile; tags: string[] }) => {
+				const file = fd.file;
+				const item = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:4px;padding:6px 4px;border-bottom:1px solid var(--background-modifier-border);font-size:18px;cursor:pointer;transition:background 0.15s;" } });
+				item.classList.add("qg-hover-bg");
+				const nameEl = item.createSpan({ text: file.name, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--interactive-accent);" } });
+				nameEl.addEventListener("click", () => { void this.app.workspace.openLinkText(file.path, "", false); });
+				const kp = knowledgeTags(fd.tags);
+				if (kp.length > 0) item.createSpan({ text: "#" + kp[0], attr: { style: "font-size:16px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80px;" } });
+				const d = new Date(file.stat.mtime);
+				item.createSpan({ text: (d.getMonth() + 1) + "/" + d.getDate(), attr: { style: "font-size:16px;color:var(--text-muted);" } });
+				const actRow = item.createDiv({ attr: { style: "display:flex;gap:2px;flex-shrink:0;" } });
+				const actBtn = (label: string, tip: string, cb: () => void) => {
+					const b = actRow.createSpan({ text: label, attr: { title: tip, style: "padding:1px 4px;border-radius:3px;cursor:pointer;font-size:16px;" } });
+					b.addEventListener("click", (e) => { e.stopPropagation(); cb(); });
+				};
+				actBtn("📖", "打开", () => { void this.app.workspace.openLinkText(file.path, "", false).catch(() => {}); });
+				actBtn("🗑", "删除", () => {
+					void (async () => {
+						if (!confirm("确定删除笔记「" + file.basename + "」？")) return;
+						try {
+							if (isAbs(folder)) { fs.unlinkSync(file.path); } else { await this.app.fileManager.trashFile(file); }
+							new Notice("已删除");
+							void this.renderNotesTab();
+						} catch (err) { new Notice("删除失败：" + (err as Error).message); }
+					})();
+				});
+			};
+
+			if (this.notesSortMode === "default") {
+				for (const fd of filtered) renderFileItem(listEl, fd);
+			} else if (this.notesSortMode === "source") {
+				const groups: Record<string, { file: TFile; tags: string[] }[]> = {};
+				const noSource: { file: TFile; tags: string[] }[] = [];
+				for (const fd of filtered) {
+					const src = fd.file.basename;
+					if (!src) { noSource.push(fd); continue; }
+					const arr = groups[src] || (groups[src] = []);
+					arr.push(fd);
+				}
+				const sorted = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+				for (const [src, srcFiles] of sorted) {
+					const group = listEl.createDiv({ attr: { style: "margin-bottom:8px;border:1px solid var(--background-modifier-border);border-radius:6px;overflow:hidden;" } });
+					const header = group.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;background:var(--background-secondary);" } });
+					const arrow = header.createSpan({ text: "▸", attr: { style: "font-size:17px;color:var(--text-muted);min-width:14px;" } });
+					header.createSpan({ text: src, attr: { style: "font-weight:600;font-size:18px;color:var(--color-green);flex:1;" } });
+					header.createSpan({ text: srcFiles.length + "篇", attr: { style: "font-size:17px;color:var(--text-muted);" } });
+					const list = group.createDiv({ attr: { style: "display:none;padding:4px 8px;" } });
+					for (const fd of srcFiles) renderFileItem(list, fd);
+					let expanded = false;
+					header.addEventListener("click", () => { expanded = !expanded; list.style.display = expanded ? "block" : "none"; arrow.setText(expanded ? "▾" : "▸"); });
+				}
+				if (noSource.length > 0) {
+					listEl.createDiv({ text: "未分类", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin:10px 0 6px;" } });
+					for (const fd of noSource) renderFileItem(listEl, fd);
+				}
+			} else if (this.notesSortMode === "tag") {
+				const tagGroups: Record<string, { file: TFile; tags: string[] }[]> = {};
+				const untagged: { file: TFile; tags: string[] }[] = [];
+				for (const fd of filtered) {
+					const kp = knowledgeTags(fd.tags);
+					if (kp.length === 0) { untagged.push(fd); continue; }
+					for (const t of kp) {
+						const arr = tagGroups[t] || (tagGroups[t] = []);
+						arr.push(fd);
+					}
+				}
+				const sortedTags = Object.entries(tagGroups).sort((a, b) => b[1].length - a[1].length);
+				for (const [tag, tagFiles] of sortedTags) {
+					const group = listEl.createDiv({ attr: { style: "margin-bottom:8px;border:1px solid var(--background-modifier-border);border-radius:6px;overflow:hidden;" } });
+					const header = group.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;background:var(--background-secondary);" } });
+					const arrow = header.createSpan({ text: "▸", attr: { style: "font-size:17px;color:var(--text-muted);min-width:14px;" } });
+					header.createSpan({ text: "#" + tag, attr: { style: "font-weight:600;font-size:18px;color:var(--color-green);flex:1;" } });
+					header.createSpan({ text: tagFiles.length + "篇", attr: { style: "font-size:17px;color:var(--text-muted);" } });
+					const list = group.createDiv({ attr: { style: "display:none;padding:4px 8px;" } });
+					for (const fd of tagFiles) renderFileItem(list, fd);
+					let expanded = false;
+					header.addEventListener("click", () => { expanded = !expanded; list.style.display = expanded ? "block" : "none"; arrow.setText(expanded ? "▾" : "▸"); });
+				}
+				if (untagged.length > 0) {
+					listEl.createDiv({ text: "未分类", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin:10px 0 6px;" } });
+					for (const fd of untagged) renderFileItem(listEl, fd);
+				}
+			} else if (this.notesSortMode === "time") {
+				const sorted = [...filtered].sort((a, b) => (b.file.stat.mtime || 0) - (a.file.stat.mtime || 0));
+				for (const fd of sorted) renderFileItem(listEl, fd);
+			}
+		};
+		searchEl.addEventListener("input", debounce(() => renderList(searchEl.value), SEARCH_DEBOUNCE_MS));
+		renderList("");
+	}
+
+	renderNotePicker(el: HTMLDivElement) {
+		const backBtn = el.createEl("button", { text: "← 返回笔记列表", attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);font-size:19px;margin-bottom:12px;" } });
+		backBtn.addEventListener("click", () => { this.notePickerActive = false; void this.renderNotesTab(); });
+		el.createDiv({ text: "选择要加入笔记库的文件", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:8px;" } });
+
+		const excludeList = this.buildExcludeList();
+		this.fpAllFiles = this.app.vault.getFiles().filter(f => {
+			if (f.extension !== "md") return false;
+			const lowerPath = f.path.toLowerCase();
+			for (const ex of excludeList) {
+				if (lowerPath.includes(ex.toLowerCase() + "/") || lowerPath.startsWith(ex.toLowerCase())) return false;
+			}
+			return true;
+		});
+
+		const infoEl = el.createDiv({ attr: { style: "color:var(--text-muted);font-size:18px;margin-bottom:8px;" } });
+		infoEl.setText("共 " + this.fpAllFiles.length + " 个文档，已选 " + this.fpSelected.size + " 个");
+
+		const searchDiv = el.createDiv({ attr: { style: "margin-bottom:8px;" } });
+		const searchInput = searchDiv.createEl("input", { attr: { type: "text", placeholder: "搜索文件名...", style: "width:100%;padding:6px 8px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
+
+		const toolBar = el.createDiv({ attr: { style: "margin-bottom:8px;display:flex;gap:6px;" } });
+		const toolBtn = (label: string, cb: () => void) => {
+			const b = toolBar.createEl("button", { text: label, attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;font-size:18px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
+			b.addEventListener("click", cb);
+		};
+		toolBtn("全选", () => { this.fpAllFiles.forEach(f => this.fpSelected.add(f.path)); this.fpRenderTree(listEl, searchInput, infoEl); });
+		toolBtn("取消全选", () => { this.fpSelected.clear(); this.fpRenderTree(listEl, searchInput, infoEl); });
+
+		const listEl = el.createDiv({ attr: { style: "max-height:450px;overflow-y:auto;" } });
+		searchInput.addEventListener("input", debounce(() => this.fpRenderTree(listEl, searchInput, infoEl), SEARCH_DEBOUNCE_MS));
+		this.fpRenderTree(listEl, searchInput, infoEl);
+
+		const btnRow = el.createDiv({ attr: { style: "margin-top:12px;display:flex;gap:8px;" } });
+		const confirmBtn = btnRow.createEl("button", { text: "创建笔记 (" + this.fpSelected.size + "个)", attr: { class: "mod-cta", style: "padding:6px 16px;border-radius:4px;cursor:pointer;font-size:19px;" } });
+		confirmBtn.addEventListener("click", () => {
+			void (async () => {
+				const chosen = this.fpAllFiles.filter(f => this.fpSelected.has(f.path));
+				if (chosen.length === 0) { new Notice("请至少选择一个文件"); return; }
+				const noteFolder = this.plugin.rootPath(this.plugin.settings.noteViewFolder);
+				await ensureFolder(this.app, noteFolder);
+				let count = 0;
+				for (const f of chosen) {
+					const content = await this.app.vault.read(f);
+					const dateStr = new Date().toISOString().slice(0, 10);
+					const fm = buildFM({ source: "[[" + f.basename + "]]", sourcePath: f.path, date: dateStr, tags: [] });
+					const noteFileName = safeName(f.basename) + "_笔记_" + dateStr + ".md";
+					const notePath = noteFolder + "/" + noteFileName;
+					try { await this.app.vault.create(notePath, fm + content); count++; }
+					catch { try { await this.app.vault.create(noteFolder + "/" + safeName(f.basename) + "_笔记_" + Date.now() + ".md", fm + content); count++; } catch { /* skip */ } }
+				}
+				new Notice("已创建 " + count + " 个笔记");
+				this.notePickerActive = false;
+				this.fpSelected.clear();
+				void this.renderNotesTab();
+			})();
+		});
+	}
+
+	async listNoteViewFiles(folder: string): Promise<TFile[]> {
 		if (isAbs(folder)) {
 			try {
 				if (!fs.existsSync(folder)) return [];
@@ -1307,7 +1623,7 @@ class MainSidebarView extends ItemView {
 				return files.map((f: string) => {
 					const fp = path.join(folder, f);
 					const stat = fs.statSync(fp);
-					return { name: f, path: fp, basename: f.replace(/\.md$/, ""), stat: { mtime: stat.mtimeMs } } as unknown as TFile;
+					return { name: f, path: fp, basename: f.replace(/\.md$/, ""), stat: { mtime: stat.mtimeMs, size: stat.size } } as unknown as TFile;
 				}).sort((a: TFile, b: TFile) => (b.stat.mtime || 0) - (a.stat.mtime || 0));
 			} catch { return []; }
 		}
@@ -1335,20 +1651,18 @@ class MainSidebarView extends ItemView {
 
 		const notes = await this.plugin.loadAllWrongNotes();
 		this.wrongNotes = notes;
-		const unmastered = notes.filter((n: WrongAnswerNote) => !n.mastered);
-		const mastered = notes.filter((n: WrongAnswerNote) => n.mastered);
 		const dueNotes = notes.filter((n: WrongAnswerNote) => isDueForReview(n));
 
 		const statsRow = el.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:10px;font-size:18px;" } });
-		statsRow.createSpan({ text: "待复习 " + unmastered.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-orange) 15%, transparent);color:var(--color-orange);font-weight:600;" } });
-		statsRow.createSpan({ text: "已掌握 " + mastered.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-green) 15%, transparent);color:var(--color-green);" } });
+		statsRow.createSpan({ text: "错题 " + notes.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-red) 15%, transparent);color:var(--color-red);font-weight:600;" } });
+		statsRow.createSpan({ text: "待复习 " + dueNotes.length, attr: { style: "padding:3px 8px;border-radius:4px;background:color-mix(in srgb, var(--color-orange) 15%, transparent);color:var(--color-orange);font-weight:600;" } });
 
 		const modeBar = el.createDiv({ attr: { style: "display:flex;gap:2px;margin-bottom:10px;" } });
-		const sortModes: { key: "tag" | "source" | "date" | "default"; label: string }[] = [
-			{ key: "tag", label: "按知识点" },
-			{ key: "source", label: "按源文件" },
-			{ key: "date", label: "按时间" },
+		const sortModes: { key: "default" | "source" | "tag" | "time"; label: string }[] = [
 			{ key: "default", label: "默认" },
+			{ key: "source", label: "按源文件" },
+			{ key: "tag", label: "按知识点" },
+			{ key: "time", label: "按时间" },
 		];
 		for (const m of sortModes) {
 			const mb = modeBar.createEl("button", { text: m.label, attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.wrongSortMode === m.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
@@ -1364,14 +1678,14 @@ class MainSidebarView extends ItemView {
 		const listEl = el.createDiv({});
 
 		if (this.wrongSortMode === "default") {
-			for (const note of unmastered) this.renderWrongNoteItem(listEl, note);
-		} else if (this.wrongSortMode === "date") {
-			const sorted = [...unmastered].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+			for (const note of notes) this.renderWrongNoteItem(listEl, note);
+		} else if (this.wrongSortMode === "time") {
+			const sorted = [...notes].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
 			for (const note of sorted) this.renderWrongNoteItem(listEl, note);
 		} else if (this.wrongSortMode === "source") {
 			const sourceGroups: Record<string, WrongAnswerNote[]> = {};
 			const noSource: WrongAnswerNote[] = [];
-			for (const note of unmastered) {
+			for (const note of notes) {
 				const src = (note.sourceFile || "").replace(/\[\[|\]\]/g, "").trim();
 				if (!src) { noSource.push(note); continue; }
 				if (!sourceGroups[src]) sourceGroups[src] = [];
@@ -1396,7 +1710,7 @@ class MainSidebarView extends ItemView {
 		} else {
 			const tagGroups: Record<string, WrongAnswerNote[]> = {};
 			const untagged: WrongAnswerNote[] = [];
-			for (const note of unmastered) {
+			for (const note of notes) {
 				const kp = knowledgeTags(note.tags);
 				if (kp.length === 0) { untagged.push(note); continue; }
 				for (const t of kp) {
@@ -1423,16 +1737,6 @@ class MainSidebarView extends ItemView {
 			}
 		}
 
-		if (mastered.length > 0) {
-			const mh = el.createDiv({ attr: { style: "cursor:pointer;color:var(--text-muted);font-size:18px;padding:6px;margin-top:10px;" } });
-			mh.createSpan({ text: "已掌握 (" + mastered.length + ") ▸" });
-			let show = false;
-			const mc = el.createDiv({ attr: { style: "display:none;" } });
-			mh.addEventListener("click", () => { show = !show; mc.style.display = show ? "block" : "none"; mh.querySelector("span")!.textContent = "已掌握 (" + mastered.length + ") " + (show ? "▾" : "▸"); });
-			for (const note of mastered.slice(0, MAX_MASTERED_DISPLAY)) this.renderWrongNoteItem(mc, note);
-			el.appendChild(mc);
-		}
-
 		if (notes.length === 0) {
 			el.createDiv({ text: "暂无错题记录", attr: { style: "color:var(--text-faint);text-align:center;padding:20px 0;font-size:19px;" } });
 		}
@@ -1453,6 +1757,16 @@ class MainSidebarView extends ItemView {
 		if (note.tags.length > 0) {
 			const kTags = knowledgeTags(note.tags);
 			if (kTags.length > 0) item.createSpan({ text: "#" + kTags[0], cls: "qg-note-tag" });
+		}
+		if ((note.wrongCount || 0) > 0) item.createSpan({ text: "错" + note.wrongCount + "次", attr: { style: "font-size:16px;color:var(--color-red);min-width:36px;text-align:right;" } });
+		if (note.nextReview) {
+			const isOverdue = isDueForReview(note);
+			if (isOverdue) {
+				item.createSpan({ text: "已到期", attr: { style: "font-size:16px;color:var(--interactive-accent);font-weight:600;min-width:40px;text-align:right;" } });
+			} else {
+				const days = daysUntil(note.nextReview);
+				item.createSpan({ text: days + "天后", attr: { style: "font-size:16px;color:var(--text-faint);min-width:40px;text-align:right;" } });
+			}
 		}
 		const delBtn = item.createSpan({ text: "×", cls: "qg-note-del" });
 		delBtn.addEventListener("click", (e) => {
@@ -1497,58 +1811,29 @@ class MainSidebarView extends ItemView {
 			if (!note.resultText) { new Notice("无题目内容"); return; }
 			this.startAnswer(note.resultText, note.sourceFile || note.baseName, note.sourcePath || "");
 		});
-		if (!note.mastered) actBtn("标记已掌握", "", () => { void this.wrongMarkMastered(note); });
-		actBtn("基于原文重新出题", "", () => { void this.wrongRePracticeSingle(note); });
+		actBtn("基于原文重新生成", "", () => { void this.wrongRePracticeSingle(note); });
 		actBtn("导出MD", "", () => { void this.wrongExportNote(note, "md"); });
 		actBtn("导出Word", "", () => { void this.wrongExportNote(note, "word"); });
 		actBtn("导出PDF", "", () => { void this.wrongExportNote(note, "pdf"); });
 		actBtn("删除", "mod-warning", () => { void this.wrongDeleteNote(note); });
 
-		if (!note.mastered) {
-			const due = isDueForReview(note);
-			const reviewSection = el.createDiv({ attr: { style: "margin-top:12px;padding:12px;border-radius:8px;border:1px solid " + (due ? "var(--interactive-accent)" : "var(--background-modifier-border)") + ";background:" + (due ? "color-mix(in srgb, var(--interactive-accent) 5%, transparent)" : "var(--background-secondary)") + ";" } });
-			const dueInfo = due ? "已到复习时间" : "下次复习: " + (note.nextReview || "未设置");
-			reviewSection.createDiv({ text: dueInfo + "　间隔: " + note.interval + "天　已复习" + note.reviewCount + "次", attr: { style: "font-size:18px;color:var(--text-muted);margin-bottom:8px;" } });
-			reviewSection.createDiv({ text: "答题后评价掌握程度：", attr: { style: "font-size:19px;font-weight:600;margin-bottom:8px;" } });
-			const qRow = reviewSection.createDiv({ attr: { style: "display:flex;gap:6px;flex-wrap:wrap;" } });
-			const qualities = [
-				{ label: "完全不会", quality: 0, color: "var(--color-red)" },
-				{ label: "很困难", quality: 1, color: "var(--color-orange)" },
-				{ label: "记住了", quality: 2, color: "var(--color-yellow)" },
-				{ label: "很简单", quality: 3, color: "var(--color-green)" }
-			];
-			for (const q of qualities) {
-				const btn = qRow.createEl("button", { text: q.label, attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;font-size:18px;border:2px solid " + q.color + ";background:var(--background-secondary);color:var(--text-normal);" } });
-				btn.addEventListener("click", () => { void (async () => { await this.wrongUpdateScheduling(note, q.quality); })(); });
-			}
-		}
-	}
-
-	async wrongMarkMastered(note: WrongAnswerNote, silent = false) {
-		if (isAbs(this.plugin.settings.wrongBookFolder)) {
-			const content = readFileStr(note.filePath);
-			const { meta, body } = parseFM(content);
-			meta.mastered = true;
-			if (Array.isArray(meta.tags)) { meta.tags = meta.tags.filter((t: string) => t !== "错题"); if (!meta.tags.includes("已掌握")) meta.tags.push("已掌握"); }
-			writeFileStr(note.filePath, buildFM(meta) + body);
-		} else {
-			const file = this.app.vault.getAbstractFileByPath(note.filePath);
-			if (!(file instanceof TFile)) return;
-			const content = await this.app.vault.read(file);
-			const { meta, body } = parseFM(content);
-			meta.mastered = true;
-			if (Array.isArray(meta.tags)) { meta.tags = meta.tags.filter((t: string) => t !== "错题"); if (!meta.tags.includes("已掌握")) meta.tags.push("已掌握"); }
-			await this.app.vault.modify(file, buildFM(meta) + body);
-		}
-		if (!silent) new Notice("已标记为掌握");
-		this.plugin.emitDataChanged();
-		this.wrongView = "list";
-		this.wrongCurrentNote = null;
-		await this.renderWrongTab();
+		const due = isDueForReview(note);
+		const reviewSection = el.createDiv({ attr: { style: "margin-top:12px;padding:12px;border-radius:8px;border:1px solid " + (due ? "var(--interactive-accent)" : "var(--background-modifier-border)") + ";background:" + (due ? "color-mix(in srgb, var(--interactive-accent) 5%, transparent)" : "var(--background-secondary)") + ";" } });
+		const dueInfo = due ? "已到复习时间" : "下次复习: " + (note.nextReview || "未设置");
+		const correctCount = note.correctCount || 0;
+		const wrongCount = note.wrongCount || 0;
+		reviewSection.createDiv({ text: dueInfo + "　间隔: " + note.interval + "天　答对" + correctCount + "次　答错" + wrongCount + "次", attr: { style: "font-size:18px;color:var(--text-muted);margin-bottom:8px;" } });
+		reviewSection.createDiv({ text: "判断对错：", attr: { style: "font-size:19px;font-weight:600;margin-bottom:8px;" } });
+		const qRow = reviewSection.createDiv({ attr: { style: "display:flex;gap:8px;" } });
+		const correctBtn = qRow.createEl("button", { text: "✓ 正确", attr: { style: "padding:6px 16px;border-radius:4px;cursor:pointer;font-size:18px;border:2px solid var(--color-green);background:var(--background-secondary);color:var(--color-green);font-weight:600;" } });
+		correctBtn.addEventListener("click", () => { void this.wrongUpdateScheduling(note, true); });
+		const wrongBtn = qRow.createEl("button", { text: "✗ 错误", attr: { style: "padding:6px 16px;border-radius:4px;cursor:pointer;font-size:18px;border:2px solid var(--color-red);background:var(--background-secondary);color:var(--color-red);font-weight:600;" } });
+		wrongBtn.addEventListener("click", () => { void this.wrongUpdateScheduling(note, false); });
 	}
 
 	async wrongDeleteNote(note: WrongAnswerNote) {
-		if (isAbs(this.plugin.settings.wrongBookFolder)) deleteFileAbs(note.filePath);
+		if (!confirm("确定删除这条错题记录？此操作不可撤销。")) return;
+		if (isAbs(this.plugin.rootPath(this.plugin.settings.wrongBookFolder))) deleteFileAbs(note.filePath);
 		else { const file = this.app.vault.getAbstractFileByPath(note.filePath); if (file instanceof TFile) await this.app.fileManager.trashFile(file); }
 		new Notice("已删除");
 		this.plugin.emitDataChanged();
@@ -1564,8 +1849,8 @@ class MainSidebarView extends ItemView {
 		let srcPath = "";
 		const src = this.app.vault.getFiles().find(f => f.basename === srcName || f.name === srcName);
 		if (src) { sourceText = await this.app.vault.read(src); found = true; srcPath = src.path; }
-		else if (isAbs(this.plugin.settings.questionFolder)) {
-			const qDir = this.plugin.settings.questionFolder;
+		else if (isAbs(this.plugin.rootPath(this.plugin.settings.questionFolder))) {
+			const qDir = this.plugin.rootPath(this.plugin.settings.questionFolder);
 			if (fs.existsSync(qDir)) {
 				for (const f of fs.readdirSync(qDir)) {
 					if (f.includes(srcName) && f.endsWith(".md")) { sourceText = readFileStr(qDir + "\\" + f); found = true; srcPath = qDir + "\\" + f; break; }
@@ -1577,20 +1862,20 @@ class MainSidebarView extends ItemView {
 	}
 
 	async wrongRePracticeDue() {
-		const dueNotes = this.wrongNotes.filter(n => !n.mastered && isDueForReview(n));
+		const dueNotes = this.wrongNotes.filter(n => isDueForReview(n));
 		const sources: string[] = [];
 		const paths: string[] = [];
 		for (const note of dueNotes) {
 			const srcName = note.sourceFile.replace(/\[\[|\]\]/g, "");
 			const src = this.app.vault.getFiles().find(f => f.basename === srcName || f.name === srcName);
 			if (src) { sources.push(await this.app.vault.read(src)); paths.push(src.path); }
-			else if (isAbs(this.plugin.settings.questionFolder)) {
-				const qDir = this.plugin.settings.questionFolder;
+			else if (isAbs(this.plugin.rootPath(this.plugin.settings.questionFolder))) {
+				const qDir = this.plugin.rootPath(this.plugin.settings.questionFolder);
 				if (fs.existsSync(qDir)) { for (const f of fs.readdirSync(qDir)) { if (f.includes(srcName) && f.endsWith(".md")) { sources.push(readFileStr(qDir + "\\" + f)); paths.push(qDir + "\\" + f); break; } } }
 			}
 		}
 		if (sources.length === 0) { new Notice("没有可用的源文件"); return; }
-		this.startGenerate(sources.join("\n\n---\n\n"), "今日待复习出题", paths.join(","));
+		this.startGenerate(sources.join("\n\n---\n\n"), "今日待复习题目", paths.join(","));
 	}
 
 	async wrongExportNote(note: WrongAnswerNote, format: "md" | "word" | "pdf") {
@@ -1621,275 +1906,234 @@ class MainSidebarView extends ItemView {
 		} catch (err) { new Notice("导出失败：" + (err as Error).message); }
 	}
 
-	async wrongUpdateScheduling(note: WrongAnswerNote, quality: number) {
-		const result = sm2Update(note.easeFactor || 2.5, note.interval || 1, quality);
-		if (isAbs(this.plugin.settings.wrongBookFolder)) {
-			const content = readFileStr(note.filePath);
-			const { meta, body } = parseFM(content);
-			meta.interval = result.interval;
-			meta.easeFactor = result.easeFactor;
-			meta.nextReview = result.nextReview;
-			meta.reviewCount = (typeof meta.reviewCount === "number" ? meta.reviewCount : 0) + 1;
-			if (quality >= 2 && result.interval >= 14) {
-				meta.mastered = true;
-				if (Array.isArray(meta.tags)) { meta.tags = meta.tags.filter((t: string) => t !== "错题"); if (!meta.tags.includes("已掌握")) meta.tags.push("已掌握"); }
+	async wrongUpdateScheduling(note: WrongAnswerNote, wasCorrect: boolean) {
+		try {
+			const result = reviewUpdate(note.correctCount || 0, wasCorrect, parseReviewIntervals(this.plugin.settings.wrongReviewIntervals, DEFAULT_WRONG_INTERVALS));
+			const wrongCount = note.wrongCount || 0;
+			const newWrongCount = wasCorrect ? wrongCount : wrongCount + 1;
+			if (isAbs(this.plugin.rootPath(this.plugin.settings.wrongBookFolder))) {
+				const content = readFileStr(note.filePath);
+				const { meta, body } = parseFM(content);
+				meta.interval = result.interval;
+				meta.correctCount = result.correctCount;
+				meta.wrongCount = newWrongCount;
+				meta.nextReview = result.nextReview;
+				writeFileStr(note.filePath, buildFM(meta) + body);
+			} else {
+				const file = this.app.vault.getAbstractFileByPath(note.filePath);
+				if (!(file instanceof TFile)) return;
+				const content = await this.app.vault.read(file);
+				const { meta, body } = parseFM(content);
+				meta.interval = result.interval;
+				meta.correctCount = result.correctCount;
+				meta.wrongCount = newWrongCount;
+				meta.nextReview = result.nextReview;
+				await this.app.vault.modify(file, buildFM(meta) + body);
 			}
-			writeFileStr(note.filePath, buildFM(meta) + body);
-		} else {
-			const file = this.app.vault.getAbstractFileByPath(note.filePath);
-			if (!(file instanceof TFile)) return;
-			const content = await this.app.vault.read(file);
-			const { meta, body } = parseFM(content);
-			meta.interval = result.interval;
-			meta.easeFactor = result.easeFactor;
-			meta.nextReview = result.nextReview;
-			meta.reviewCount = (typeof meta.reviewCount === "number" ? meta.reviewCount : 0) + 1;
-			if (quality >= 2 && result.interval >= 14) {
-				meta.mastered = true;
-				if (Array.isArray(meta.tags)) { meta.tags = meta.tags.filter((t: string) => t !== "错题"); if (!meta.tags.includes("已掌握")) meta.tags.push("已掌握"); }
-			}
-			await this.app.vault.modify(file, buildFM(meta) + body);
+			new Notice(wasCorrect ? "正确！下次复习 " + result.nextReview + "（间隔" + result.interval + "天）" : "已记录错误，明天复习");
+			this.plugin.emitDataChanged();
+			this.wrongView = "list";
+			this.wrongCurrentNote = null;
+			await this.renderWrongTab();
+		} catch (err) {
+			new Notice("更新复习计划失败：" + (err as Error).message);
 		}
-		const labels = ["完全不会", "很困难", "记住了", "很简单"];
-		new Notice("已记录：" + labels[quality] + "，下次复习 " + result.nextReview + "（间隔" + result.interval + "天）");
-		if (quality >= 2 && result.interval >= 14) new Notice("已自动标记为掌握！");
-		this.plugin.emitDataChanged();
-		this.wrongView = "list";
-		this.wrongCurrentNote = null;
-		await this.renderWrongTab();
 	}
 
-	// ===================== ANALYTICS TAB =====================
-	async renderAnalyticsTab() {
+	// ===================== REVIEW TAB =====================
+	async renderReviewTab() {
 		if (!this.innerContentEl) return;
 		const el = this.innerContentEl;
 		el.empty();
 
-		const history = this.plugin.history;
+		if (this.reviewSortBy === "default" && this.plugin.settings.sortReviewBy !== "default") this.reviewSortBy = this.plugin.settings.sortReviewBy;
+
 		const wrongNotes = await this.plugin.loadAllWrongNotes();
-		const mastered = wrongNotes.filter(n => n.mastered);
-		const total = wrongNotes.length;
-		const masteryRate = total > 0 ? Math.round((mastered.length / total) * 100) : 0;
-		const dueCount = wrongNotes.filter(n => isDueForReview(n)).length;
+		const questionFiles = await this.plugin.loadAllQuestionFilesForReview();
+		const vaultNotes = await this.plugin.loadAllVaultNotesForReview();
 
-		const statsGrid = el.createDiv({ attr: { style: "display:grid;grid-template-columns:repeat(auto-fit, minmax(100px, 1fr));gap:6px;margin-bottom:14px;" } });
-		const miniStat = (label: string, value: string, color?: string) => {
-			const c = statsGrid.createDiv({ attr: { style: "text-align:center;padding:8px 4px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);" } });
-			c.createDiv({ text: value, attr: { style: "font-size:25px;font-weight:bold;" + (color ? "color:" + color + ";" : "") } });
-			c.createDiv({ text: label, attr: { style: "color:var(--text-muted);font-size:16px;margin-top:2px;" } });
-		};
-		miniStat("出题", String(history.length));
-		miniStat("错题", String(total));
-		miniStat("掌握率", masteryRate + "%", masteryRate >= 80 ? "var(--color-green)" : masteryRate >= 50 ? "var(--color-yellow)" : "var(--color-red)");
-		miniStat("待复习", String(dueCount), dueCount > 0 ? "var(--interactive-accent)" : undefined);
+		type ReviewItem = { note: WrongAnswerNote; source: "wrong" | "question" | "note" };
+		const allItems: ReviewItem[] = [
+			...wrongNotes.map(n => ({ note: n, source: "wrong" as const })),
+			...questionFiles.map(n => ({ note: n, source: "question" as const })),
+			...vaultNotes.map(n => ({ note: n, source: "note" as const })),
+		];
 
-		const weakPoints = await this.plugin.getWeakPoints();
-		if (weakPoints.length > 0) {
-			el.createDiv({ text: "薄弱知识点", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin-bottom:6px;" } });
-			const maxT = weakPoints[0]!.count;
-			for (const wp of weakPoints.slice(0, MAX_WEAK_POINTS_DISPLAY)) {
-				const row = el.createDiv({ attr: { style: "margin-bottom:6px;" } });
-				const header = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;font-size:18px;cursor:pointer;" } });
-				header.createSpan({ text: "#" + wp.tag, attr: { style: "min-width:60px;font-weight:500;color:var(--interactive-accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" } });
-				const bar = header.createDiv({ attr: { style: "flex:1;height:8px;background:var(--background-modifier-border);border-radius:4px;overflow:hidden;" } });
-				bar.createDiv({ attr: { style: "height:100%;width:" + Math.round((wp.count / maxT) * 100) + "%;background:var(--color-red);border-radius:4px;opacity:0.7;" } });
-				header.createSpan({ text: String(wp.count), attr: { style: "min-width:16px;text-align:right;color:var(--text-muted);" } });
+		const filterBar = el.createDiv({ attr: { style: "display:flex;gap:2px;margin-bottom:10px;" } });
+		const filterOpts: { key: "all" | "wrong" | "question" | "note"; label: string }[] = [
+			{ key: "all", label: "全部" },
+			{ key: "wrong", label: "错题" },
+			{ key: "question", label: "题目" },
+			{ key: "note", label: "笔记" },
+		];
+		for (const opt of filterOpts) {
+			const count = opt.key === "all" ? allItems.length : allItems.filter(i => i.source === opt.key).length;
+			const btn = filterBar.createEl("button", { text: opt.label + " (" + count + ")", attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.reviewFilterType === opt.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
+			btn.addEventListener("click", () => { this.reviewFilterType = opt.key; void this.renderReviewTab(); });
+		}
 
-				const detailEl = row.createDiv({ attr: { style: "display:none;margin-top:4px;padding-left:66px;" } });
-				for (const q of wp.questions.slice(0, PREVIEW_ITEMS_LIMIT)) {
-					const qItem = detailEl.createDiv({ attr: { style: "font-size:17px;color:var(--text-faint);padding:2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;" } });
-					const snippet = q.resultText.split("\n")[0]?.slice(0, 50) || q.baseName;
-					qItem.setText(snippet);
-					qItem.addEventListener("click", () => { this.wrongView = "detail"; this.wrongCurrentNote = q; this.activeSection = "wrong"; void this.render(); });
+		const sortBar = el.createDiv({ attr: { style: "display:flex;gap:2px;margin-bottom:10px;" } });
+		const sortOpts: { key: "default" | "source" | "tag" | "time"; label: string }[] = [
+			{ key: "default", label: "默认" },
+			{ key: "source", label: "按源文件" },
+			{ key: "tag", label: "按知识点" },
+			{ key: "time", label: "按时间" },
+		];
+		for (const opt of sortOpts) {
+			const btn = sortBar.createEl("button", { text: opt.label, attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.reviewSortBy === opt.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
+			btn.addEventListener("click", () => { this.reviewSortBy = opt.key; void this.renderReviewTab(); });
+		}
+
+		if (allItems.length === 0) {
+			el.createDiv({ text: "暂无待复习内容，开始答题积累数据吧！", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } });
+			return;
+		}
+
+		const today = todayStr();
+		const filteredItems = this.reviewFilterType === "all" ? allItems : allItems.filter(i => i.source === this.reviewFilterType);
+		const dueItems = filteredItems.filter(i => isDueForReview(i.note));
+		const upcomingItems = filteredItems.filter(i => i.note.nextReview && i.note.nextReview > today);
+
+		const sourceLabel: Record<string, string> = { wrong: "错题", question: "题目", note: "笔记" };
+		const sourceColor: Record<string, string> = { wrong: "var(--color-red)", question: "var(--interactive-accent)", note: "var(--color-green)" };
+
+		if (dueItems.length > 0) {
+			const banner = el.createDiv({ attr: { style: "padding:14px 16px;margin-bottom:14px;border-radius:8px;border:2px solid var(--interactive-accent);background:color-mix(in srgb, var(--interactive-accent) 8%, transparent);" } });
+			const bTop = banner.createDiv({ attr: { style: "display:flex;align-items:center;justify-content:space-between;" } });
+			bTop.createDiv({ text: "今日待复习", attr: { style: "font-size:20px;font-weight:700;color:var(--interactive-accent);" } });
+			bTop.createDiv({ text: dueItems.length + " 项", attr: { style: "font-size:26px;font-weight:bold;color:var(--interactive-accent);" } });
+			const parts: string[] = [];
+			const wDue = dueItems.filter(i => i.source === "wrong").length;
+			const qDue = dueItems.filter(i => i.source === "question").length;
+			const nDue = dueItems.filter(i => i.source === "note").length;
+			if (wDue > 0) parts.push("错题 " + wDue);
+			if (qDue > 0) parts.push("题目 " + qDue);
+			if (nDue > 0) parts.push("笔记 " + nDue);
+			if (parts.length > 0) banner.createDiv({ text: parts.join("　"), attr: { style: "font-size:17px;color:var(--text-muted);margin-top:4px;" } });
+		}
+
+		const sortedDue = [...dueItems];
+		const sortedUpcoming = [...upcomingItems];
+		if (this.reviewSortBy === "source") {
+			sortedDue.sort((a, b) => (a.note.sourceFile || a.note.baseName).localeCompare(b.note.sourceFile || b.note.baseName));
+			sortedUpcoming.sort((a, b) => (a.note.sourceFile || a.note.baseName).localeCompare(b.note.sourceFile || b.note.baseName));
+		} else if (this.reviewSortBy === "tag") {
+			sortedDue.sort((a, b) => (knowledgeTags(a.note.tags)[0] || "").localeCompare(knowledgeTags(b.note.tags)[0] || ""));
+			sortedUpcoming.sort((a, b) => (knowledgeTags(a.note.tags)[0] || "").localeCompare(knowledgeTags(b.note.tags)[0] || ""));
+		} else if (this.reviewSortBy === "time") {
+			sortedDue.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
+			sortedUpcoming.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
+		} else {
+			const priority: Record<string, number> = { wrong: 0, question: 1, note: 2 };
+			sortedDue.sort((a, b) => priority[a.source]! - priority[b.source]!);
+			sortedUpcoming.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
+		}
+
+		if (sortedDue.length > 0) {
+			el.createDiv({ text: "到期复习", attr: { style: "font-size:18px;font-weight:600;color:var(--interactive-accent);margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-border);" } });
+			let lastGroup = "";
+			for (const item of sortedDue) {
+				const groupKey = this.reviewSortBy === "source" ? (item.note.sourceFile || item.note.baseName) : this.reviewSortBy === "tag" ? (knowledgeTags(item.note.tags)[0] || "无标签") : "";
+				if (this.reviewSortBy !== "default" && groupKey && groupKey !== lastGroup) {
+					if (lastGroup !== "") el.createDiv({ attr: { style: "height:6px;" } });
+					el.createDiv({ text: groupKey, attr: { style: "font-size:16px;font-weight:500;color:var(--text-faint);margin-bottom:4px;padding-left:4px;" } });
+					lastGroup = groupKey;
 				}
-				if (wp.questions.length > PREVIEW_ITEMS_LIMIT) detailEl.createDiv({ text: "还有" + (wp.questions.length - PREVIEW_ITEMS_LIMIT) + "题...", attr: { style: "font-size:16px;color:var(--text-faint);padding-top:2px;" } });
+				this.renderReviewRow(el, item, sourceLabel, sourceColor, daysUntil);
+			}
+		}
 
+		if (sortedUpcoming.length > 0) {
+			el.createDiv({ text: "即将复习", attr: { style: "font-size:18px;font-weight:600;color:var(--color-green);margin-top:14px;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-border);" } });
+			const grouped: Record<number, ReviewItem[]> = {};
+			for (const item of sortedUpcoming) {
+				const days = daysUntil(item.note.nextReview);
+				if (!grouped[days]) grouped[days] = [];
+				grouped[days].push(item);
+			}
+			const sortedDays = Object.keys(grouped).map(Number).sort((a, b) => a - b);
+			for (const days of sortedDays) {
+				const items = grouped[days]!;
+				const section = el.createDiv({ attr: { style: "margin-bottom:8px;" } });
+				const header = section.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;font-size:17px;color:var(--text-muted);cursor:pointer;" } });
+				const arrow = header.createSpan({ text: "▸" });
+				header.createSpan({ text: days + "天后复习（" + items.length + "项）" });
+				const body = section.createDiv({ attr: { style: "display:none;margin-top:4px;" } });
 				let expanded = false;
-				header.addEventListener("click", () => { expanded = !expanded; detailEl.style.display = expanded ? "block" : "none"; });
-			}
-		}
-
-		if (history.length > 0) {
-			el.createDiv({ text: "近期出题", attr: { style: "font-size:18px;font-weight:600;color:var(--text-muted);margin:12px 0 6px;" } });
-			const dayCounts: Record<string, number> = {};
-			for (const h of history) { const d = new Date(h.timestamp).toISOString().slice(0, 10); dayCounts[d] = (dayCounts[d] || 0) + 1; }
-			const days = Object.entries(dayCounts).sort((a, b) => b[0].localeCompare(a[0])).slice(0, RECENT_DAYS_LIMIT);
-			if (days.length > 0) {
-				const maxDay = Math.max(...days.map(d => d[1]));
-				for (const [day, count] of days) {
-					const row = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;font-size:18px;margin-bottom:3px;" } });
-					row.createSpan({ text: day.slice(5), attr: { style: "min-width:40px;color:var(--text-muted);" } });
-					const bar = row.createDiv({ attr: { style: "flex:1;height:8px;background:var(--background-modifier-border);border-radius:4px;overflow:hidden;" } });
-					bar.createDiv({ attr: { style: "height:100%;width:" + Math.round((count / maxDay) * 100) + "%;background:var(--interactive-accent);border-radius:4px;" } });
-					row.createSpan({ text: count + "次", attr: { style: "min-width:24px;" } });
+				header.addEventListener("click", () => { expanded = !expanded; body.style.display = expanded ? "block" : "none"; arrow.setText(expanded ? "▾" : "▸"); });
+				for (const item of items) {
+					this.renderReviewRow(body, item, sourceLabel, sourceColor, daysUntil, true);
 				}
 			}
-		}
-
-		if (wrongNotes.length > 0 || history.length > 0) {
-			const exportBtn = el.createDiv({ attr: { style: "margin-top:12px;text-align:center;" } });
-			const b = exportBtn.createEl("button", { text: "导出学习报告", attr: { style: "padding:6px 16px;border-radius:4px;cursor:pointer;font-size:18px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
-			b.addEventListener("click", () => { void (async () => { await this.analyticsExportReport(wrongNotes, history); })(); });
-		}
-
-		if (wrongNotes.length === 0 && history.length === 0) {
-			el.createDiv({ text: "暂无学习数据，开始答题积累数据吧！", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } });
 		}
 	}
 
-	async analyticsExportReport(wrongNotes: WrongAnswerNote[], history: HistoryEntry[]) {
-		const unmastered = wrongNotes.filter(n => !n.mastered);
-		const mastered = wrongNotes.filter(n => n.mastered);
-		const total = wrongNotes.length;
-		const masteryRate = total > 0 ? Math.round((mastered.length / total) * 100) : 0;
-		const dueCount = wrongNotes.filter(n => isDueForReview(n)).length;
-
-		let report = "# 学习分析报告\n\n";
-		report += "生成时间：" + new Date().toLocaleString() + "\n\n";
-		report += "## 概览\n\n";
-		report += "- 出题次数：" + history.length + "\n";
-		report += "- 错题总数：" + total + "\n";
-		report += "- 已掌握：" + mastered.length + "\n";
-		report += "- 未掌握：" + unmastered.length + "\n";
-		report += "- 掌握率：" + masteryRate + "%\n";
-		report += "- 今日待复习：" + dueCount + "\n\n";
-
-		const tagCounts: Record<string, { total: number; mastered: number }> = {};
-		for (const n of wrongNotes) {
-			for (const t of knowledgeTags(n.tags)) {
-				if (!tagCounts[t]) tagCounts[t] = { total: 0, mastered: 0 };
-				tagCounts[t].total++;
-				if (n.mastered) tagCounts[t].mastered++;
+	private renderReviewRow(container: HTMLElement, item: { note: WrongAnswerNote; source: string }, sourceLabel: Record<string, string>, sourceColor: Record<string, string>, daysUntil: (s: string) => number, compact = false) {
+		const row = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:" + (compact ? "4px 8px" : "6px 8px") + ";margin-bottom:4px;border-radius:4px;border:1px solid var(--background-modifier-border);cursor:pointer;font-size:18px;transition:background 0.15s;" } });
+		row.classList.add("qg-hover-bg");
+		row.createSpan({ text: sourceLabel[item.source] || item.source, attr: { style: "min-width:32px;font-size:13px;padding:1px 5px;border-radius:3px;background:" + (sourceColor[item.source] || "var(--text-muted)") + ";color:white;" } });
+		const nameText = (item.note.sourceFile || item.note.baseName).replace(/\[\[|\]\]/g, "");
+		row.createSpan({ text: nameText, attr: { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:var(--interactive-accent);" } });
+		const kp = knowledgeTags(item.note.tags);
+		if (kp.length > 0) row.createSpan({ text: "#" + kp[0], attr: { style: "font-size:16px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80px;" } });
+		if (item.source === "wrong" && (item.note.wrongCount || 0) > 0) row.createSpan({ text: "错" + item.note.wrongCount + "次", attr: { style: "font-size:15px;color:var(--color-red);min-width:36px;text-align:right;" } });
+		if (!compact && item.note.nextReview) {
+			const isOverdue = isDueForReview(item.note);
+			if (isOverdue) {
+				row.createSpan({ text: "已到期", attr: { style: "font-size:15px;color:var(--interactive-accent);font-weight:600;min-width:44px;text-align:right;" } });
+			} else {
+				row.createSpan({ text: daysUntil(item.note.nextReview) + "天后", attr: { style: "font-size:15px;color:var(--text-faint);min-width:44px;text-align:right;" } });
 			}
 		}
-		const tagList = Object.entries(tagCounts).sort((a, b) => (b[1].total - b[1].mastered) - (a[1].total - a[1].mastered));
-		if (tagList.length > 0) {
-			report += "## 知识点掌握情况\n\n";
-			report += "| 知识点 | 总错题 | 已掌握 | 未掌握 | 掌握率 |\n";
-			report += "|--------|--------|--------|--------|--------|\n";
-			for (const [tag, data] of tagList) {
-				const rate = data.total > 0 ? Math.round((data.mastered / data.total) * 100) : 0;
-				report += "| " + tag + " | " + data.total + " | " + data.mastered + " | " + (data.total - data.mastered) + " | " + rate + "% |\n";
-			}
-			report += "\n";
-		}
-
-		if (unmastered.length > 0) {
-			report += "## 未掌握错题列表\n\n";
-			for (const n of unmastered) {
-				report += "### " + (n.sourceFile || n.baseName).replace(/\[\[|\]\]/g, "") + "\n";
-				report += "- 加入时间：" + n.date + "\n";
-				if (n.tags.length > 0) report += "- 标签：" + knowledgeTags(n.tags).map(t => "#" + t).join(" ") + "\n";
-				if (n.nextReview) report += "- 下次复习：" + n.nextReview + "（间隔" + n.interval + "天）\n";
-			const snippet = n.resultText.slice(0, MAX_REPORT_SNIPPET).replace(/\n/g, " ");
-			report += "- 内容摘要：" + snippet + (n.resultText.length > MAX_REPORT_SNIPPET ? "..." : "") + "\n\n";
-			}
-		}
-
-		if (history.length > 0) {
-			report += "## 近期出题记录\n\n";
-			const recent = history.slice(-RECENT_HISTORY_LIMIT).reverse();
-			for (const h of recent) {
-				const d = new Date(h.timestamp);
-				report += "- " + d.toLocaleDateString() + " " + d.toLocaleTimeString() + " — " + h.fileName + "\n";
-			}
-		}
-
-		await this.plugin.exportToFile(report, "学习报告", "md", "学习分析报告");
+		row.addEventListener("click", () => {
+			if (item.source === "wrong") { this.wrongView = "detail"; this.wrongCurrentNote = item.note; this.activeSection = "wrong"; void this.render(); }
+			else { void this.app.workspace.openLinkText(item.note.baseName, "", false); }
+		});
 	}
 
 	// ===================== SETTINGS TAB =====================
 	renderSettingsTab() {
 		if (!this.innerContentEl) return;
 		const el = this.innerContentEl;
+		const savedScrollTop = el.scrollTop;
 		el.empty();
 		const s = this.plugin.settings;
 
 		const section = (title: string) => {
 			el.createDiv({ text: title, attr: { style: "font-size:19px;font-weight:600;color:var(--text-muted);margin:14px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-border);" } });
 		};
-
-		section("API 配置");
-		const apiTypeRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		apiTypeRow.createSpan({ text: "接口类型", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const apiTypeSel = apiTypeRow.createEl("select", { attr: { style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		apiTypeSel.createEl("option", { value: "ollama", text: "Ollama" });
-		apiTypeSel.createEl("option", { value: "openai", text: "OpenAI兼容" });
-		apiTypeSel.value = s.apiType;
-		apiTypeSel.addEventListener("change", () => { s.apiType = apiTypeSel.value as "ollama" | "openai"; void this.plugin.saveSettings(); });
-
-		const urlRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		urlRow.createSpan({ text: "接口地址", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const urlInput = urlRow.createEl("input", { attr: { type: "text", value: s.baseUrl, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		urlInput.addEventListener("change", () => { s.baseUrl = urlInput.value; void this.plugin.saveSettings(); });
-
-		const modelRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		modelRow.createSpan({ text: "模型名称", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const modelInput = modelRow.createEl("input", { attr: { type: "text", value: s.modelName, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		modelInput.addEventListener("change", () => { s.modelName = modelInput.value; void this.plugin.saveSettings(); });
-
-		const keyRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		keyRow.createSpan({ text: "API Key", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const keyInput = keyRow.createEl("input", { attr: { type: "password", value: s.apiKey || "", style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		keyInput.addEventListener("change", () => { s.apiKey = keyInput.value; void this.plugin.saveSettings(); });
-
-		const tempRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		tempRow.createSpan({ text: "Temperature", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const tempInput = tempRow.createEl("input", { attr: { type: "number", min: "0", max: "2", step: "0.1", value: String(s.temperature), style: "width:60px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;" } });
-		tempInput.addEventListener("change", () => { s.temperature = parseFloat(tempInput.value) || 0.1; void this.plugin.saveSettings(); });
-		tempRow.createSpan({ text: String(s.temperature), attr: { id: "pg-temp-val", style: "color:var(--text-muted);min-width:30px;" } });
-		tempInput.addEventListener("input", () => { const v = tempRow.querySelector("#pg-temp-val"); if (v) v.textContent = tempInput.value; });
+		const fieldRow = (label: string, minW = "70px") => {
+			const row = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
+			row.createSpan({ text: label, attr: { style: "min-width:" + minW + ";color:var(--text-muted);" } });
+			return row;
+		};
+		const textInput = (row: HTMLElement, value: string, onChange: (v: string) => void, placeholder?: string) => {
+			const inp = row.createEl("input", { attr: { type: "text", value, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);", placeholder: placeholder || "" } });
+			inp.addEventListener("change", () => { onChange(inp.value); void this.plugin.saveSettings(); });
+			return inp;
+		};
 
 		section("文件夹");
-		const qfRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		qfRow.createSpan({ text: "出题文件夹", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const qfInput = qfRow.createEl("input", { attr: { type: "text", value: s.questionFolder, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		qfInput.addEventListener("change", () => { s.questionFolder = qfInput.value; void this.plugin.saveSettings(); });
-
-		const wbRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		wbRow.createSpan({ text: "错题本文件夹", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const wbInput = wbRow.createEl("input", { attr: { type: "text", value: s.wrongBookFolder, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		wbInput.addEventListener("change", () => { s.wrongBookFolder = wbInput.value; void this.plugin.saveSettings(); });
-
-		const exRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		exRow.createSpan({ text: "排除文件夹", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const exInput = exRow.createEl("input", { attr: { type: "text", value: s.excludeFolders, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		exInput.addEventListener("change", () => { s.excludeFolders = exInput.value; void this.plugin.saveSettings(); });
-
-		const efRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		efRow.createSpan({ text: "AI识别文件夹", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const efInput = efRow.createEl("input", { attr: { type: "text", value: s.extractedExamFolder, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		efInput.addEventListener("change", () => { s.extractedExamFolder = efInput.value; void this.plugin.saveSettings(); });
-
-		const asRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
+		el.createDiv({ text: "根文件夹下包含所有模块子文件夹，修改后需重启插件生效", attr: { style: "color:var(--text-muted);font-size:17px;margin-bottom:8px;" } });
+		textInput(fieldRow("根文件夹"), s.rootFolder, v => { s.rootFolder = v; }, "智学助手");
+		textInput(fieldRow("题目文件夹"), s.questionFolder, v => { s.questionFolder = v; });
+		textInput(fieldRow("错题文件夹"), s.wrongBookFolder, v => { s.wrongBookFolder = v; });
+		textInput(fieldRow("笔记文件夹"), s.noteViewFolder, v => { s.noteViewFolder = v; }, "笔记");
+		textInput(fieldRow("AI识别文件夹"), s.extractedExamFolder, v => { s.extractedExamFolder = v; });
+		textInput(fieldRow("排除文件夹"), s.excludeFolders, v => { s.excludeFolders = v; });
+		const asRow = fieldRow("");
 		const asCb = asRow.createEl("input", { attr: { type: "checkbox" } });
 		asCb.checked = s.autoSave;
 		asCb.addEventListener("change", () => { s.autoSave = asCb.checked; void this.plugin.saveSettings(); });
 		asRow.createSpan({ text: "生成后自动保存到题库" });
 
-		section("学习设置");
-		const wpRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		wpRow.createSpan({ text: "薄弱点阈值", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const wpInput = wpRow.createEl("input", { attr: { type: "number", min: "1", max: "20", value: String(s.weakPointThreshold), style: "width:60px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;" } });
-		wpInput.addEventListener("change", () => { s.weakPointThreshold = parseInt(wpInput.value) || 2; void this.plugin.saveSettings(); });
-		wpRow.createSpan({ text: "次以上错题标记为薄弱", attr: { style: "color:var(--text-muted);" } });
+		section("知识点文件夹");
+		el.createDiv({ text: "用于Obsidian图谱展示知识点关联，插件启动时自动创建", attr: { style: "color:var(--text-muted);font-size:17px;margin-bottom:8px;" } });
+		textInput(fieldRow("题目知识点"), s.questionKnowledgeFolder, v => { s.questionKnowledgeFolder = v; }, "题目/知识点");
+		textInput(fieldRow("笔记知识点"), s.noteKnowledgeFolder, v => { s.noteKnowledgeFolder = v; }, "笔记/知识点");
+		textInput(fieldRow("错题知识点"), s.wrongKnowledgeFolder, v => { s.wrongKnowledgeFolder = v; }, "错题/知识点");
 
-		const rrRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		const rrCb = rrRow.createEl("input", { attr: { type: "checkbox" } });
-		rrCb.checked = s.autoReviewReminder;
-		rrCb.addEventListener("change", () => { s.autoReviewReminder = rrCb.checked; void this.plugin.saveSettings(); });
-		rrRow.createSpan({ text: "启动时提醒复习" });
-
-		const sortRow = el.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:18px;" } });
-		sortRow.createSpan({ text: "错题排序", attr: { style: "min-width:70px;color:var(--text-muted);" } });
-		const sortSel = sortRow.createEl("select", { attr: { style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
-		for (const [val, label] of [["date", "按日期"], ["tag", "按知识点"], ["review", "按复习时间"]]) {
-			const opt = sortSel.createEl("option", { value: val, text: label });
-			if (s.sortWrongBy === val) opt.selected = true;
-		}
-		sortSel.addEventListener("change", () => { s.sortWrongBy = sortSel.value as "date" | "tag" | "review"; void this.plugin.saveSettings(); });
-
-		section("默认出题数量");
+		section("默认题目数量");
 		const counts = [
 			{ label: "单选题", key: "countSingle" as const },
 			{ label: "多选题", key: "countMulti" as const },
@@ -1906,9 +2150,111 @@ class MainSidebarView extends ItemView {
 			row.createSpan({ text: "题", attr: { style: "color:var(--text-muted);" } });
 		}
 
-		section("自定义提示词");
-		const promptTA = el.createEl("textarea", { attr: { value: s.systemPrompt, style: "width:100%;min-height:80px;padding:8px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;resize:vertical;", placeholder: "留空使用默认提示词..." } });
-		promptTA.addEventListener("change", () => { s.systemPrompt = promptTA.value; void this.plugin.saveSettings(); });
+		section("API 配置");
+		const apiTypeRow = fieldRow("接口类型");
+		const apiTypeSel = apiTypeRow.createEl("select", { attr: { style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
+		apiTypeSel.createEl("option", { value: "ollama", text: "Ollama" });
+		apiTypeSel.createEl("option", { value: "openai", text: "OpenAI兼容" });
+		apiTypeSel.value = s.apiType;
+		apiTypeSel.addEventListener("change", () => { s.apiType = apiTypeSel.value as "ollama" | "openai"; void this.plugin.saveSettings(); });
+		textInput(fieldRow("接口地址"), s.baseUrl, v => { s.baseUrl = v; });
+		textInput(fieldRow("模型名称"), s.modelName, v => { s.modelName = v; });
+		textInput(fieldRow("API Key"), s.apiKey || "", v => { s.apiKey = v; });
+		const tempRow = fieldRow("Temperature");
+		const tempInput = tempRow.createEl("input", { attr: { type: "number", min: "0", max: "2", step: "0.1", value: String(s.temperature), style: "width:60px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;" } });
+		tempInput.addEventListener("change", () => { s.temperature = parseFloat(tempInput.value) || 0.1; void this.plugin.saveSettings(); });
+		tempRow.createSpan({ text: String(s.temperature), attr: { id: "pg-temp-val", style: "color:var(--text-muted);min-width:30px;" } });
+		tempInput.addEventListener("input", () => { const v = tempRow.querySelector("#pg-temp-val"); if (v) v.textContent = tempInput.value; });
+
+		section("复习间隔设置");
+		el.createDiv({ text: "参数越大复习间隔越长，记忆越牢固但可能遗忘；参数越小复习越频繁，短期效果好但耗时多。推荐使用默认值。", attr: { style: "color:var(--text-muted);font-size:17px;margin-bottom:10px;line-height:1.5;padding:8px 10px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);" } });
+
+		const intervalPresets: Record<string, { label: string; hint: string; values: string; range: string }[]> = {
+			wrong: [
+				{ label: "慢速", hint: "适合基础扎实、偶尔出错的知识点", values: "2,5,10,20,40,60", range: "首间隔2天，总周期约137天" },
+				{ label: "标准", hint: "适合大部分错题复习（推荐）", values: "1,2,4,7,15,30", range: "首间隔1天，总周期约59天" },
+				{ label: "快速", hint: "适合频繁出错、需要强化的知识点", values: "1,1,2,3,5,7", range: "首间隔1天，总周期约19天" },
+			],
+			question: [
+				{ label: "慢速", hint: "适合已掌握的知识点巩固", values: "14,30,60,90,120,180", range: "首间隔14天，总周期约1.7年" },
+				{ label: "标准", hint: "适合新生成的题目复习（推荐）", values: "7,15,30,60,90", range: "首间隔7天，总周期约207天" },
+				{ label: "快速", hint: "适合需要快速消化的大量题目", values: "3,5,10,15,30", range: "首间隔3天，总周期约63天" },
+			],
+			note: [
+				{ label: "慢速", hint: "适合长期知识积累型笔记", values: "3,7,14,30,60,90", range: "首间隔3天，总周期约204天" },
+				{ label: "标准", hint: "适合课堂笔记、读书笔记（推荐）", values: "1,3,7,14,30", range: "首间隔1天，总周期约55天" },
+				{ label: "快速", hint: "适合考前突击、临时笔记", values: "1,1,2,3,5", range: "首间隔1天，总周期约12天" },
+			],
+		};
+
+		const renderIntervalRow = (label: string, currentValue: string, presetKey: string, onChange: (v: string) => void) => {
+			const row = el.createDiv({ attr: { style: "margin-bottom:14px;padding:10px;border-radius:6px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);" } });
+			row.createDiv({ text: label, attr: { style: "font-size:18px;font-weight:600;margin-bottom:6px;" } });
+			const presets = intervalPresets[presetKey]!;
+			const btnRow = row.createDiv({ attr: { style: "display:flex;gap:4px;margin-bottom:6px;" } });
+			const currentPreset = presets.find(p => p.values === currentValue);
+			for (const p of presets) {
+				const isActive = p.values === currentValue;
+				const btn = btnRow.createEl("button", { text: p.label, attr: { style: "padding:3px 10px;border-radius:3px;cursor:pointer;font-size:16px;border:1px solid var(--background-modifier-border);background:" + (isActive ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-primary);color:var(--text-muted);") } });
+				btn.addEventListener("click", () => { onChange(p.values); row.parentElement && this.renderSettingsTab(); });
+			}
+			const activePreset = currentPreset || presets[1]!;
+			const tipRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:16px;color:var(--text-muted);" } });
+			tipRow.createSpan({ text: "💡", attr: { style: "font-size:14px;" } });
+			tipRow.createSpan({ text: activePreset.hint + "。" + activePreset.range });
+			const customRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;" } });
+			customRow.createSpan({ text: "自定义：", attr: { style: "font-size:16px;color:var(--text-muted);flex-shrink:0;" } });
+			const inp = customRow.createEl("input", { attr: { type: "text", value: currentValue, style: "flex:1;padding:4px 6px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:16px;font-family:monospace;", placeholder: "如 1,2,4,7,15,30" } });
+			inp.addEventListener("change", () => { onChange(inp.value); });
+		};
+
+		renderIntervalRow("错题复习间隔（天）", s.wrongReviewIntervals, "wrong", v => { s.wrongReviewIntervals = v; });
+		renderIntervalRow("题目复习间隔（天）", s.questionReviewIntervals, "question", v => { s.questionReviewIntervals = v; });
+		renderIntervalRow("笔记复习间隔（天）", s.noteReviewIntervals, "note", v => { s.noteReviewIntervals = v; });
+		const rvSortRow = fieldRow("待复习默认排序", "100px");
+		const rvSortSel = rvSortRow.createEl("select", { attr: { style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
+		for (const [val, label] of [["default", "默认"], ["source", "按源文件"], ["tag", "按知识点"], ["time", "按时间"]]) {
+			const opt = rvSortSel.createEl("option", { value: val, text: label });
+			if (s.sortReviewBy === val) opt.selected = true;
+		}
+		rvSortSel.addEventListener("change", () => { s.sortReviewBy = rvSortSel.value as "default" | "source" | "tag" | "time"; void this.plugin.saveSettings(); });
+
+		section("学习设置");
+		const wpRow = fieldRow("薄弱点阈值");
+		const wpInput = wpRow.createEl("input", { attr: { type: "number", min: "1", max: "20", value: String(s.weakPointThreshold), style: "width:60px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;" } });
+		wpInput.addEventListener("change", () => { s.weakPointThreshold = parseInt(wpInput.value) || 2; void this.plugin.saveSettings(); });
+		wpRow.createSpan({ text: "次以上错题标记为薄弱", attr: { style: "color:var(--text-muted);" } });
+		const rrRow = fieldRow("");
+		const rrCb = rrRow.createEl("input", { attr: { type: "checkbox" } });
+		rrCb.checked = s.autoReviewReminder;
+		rrCb.addEventListener("change", () => { s.autoReviewReminder = rrCb.checked; void this.plugin.saveSettings(); });
+		rrRow.createSpan({ text: "启动时提醒复习" });
+		const sortRow = fieldRow("错题排序");
+		const sortSel = sortRow.createEl("select", { attr: { style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);" } });
+		for (const [val, label] of [["date", "按日期"], ["tag", "按知识点"], ["review", "按复习时间"]]) {
+			const opt = sortSel.createEl("option", { value: val, text: label });
+			if (s.sortWrongBy === val) opt.selected = true;
+		}
+		sortSel.addEventListener("change", () => { s.sortWrongBy = sortSel.value as "date" | "tag" | "review"; void this.plugin.saveSettings(); });
+
+		section("实用工具");
+		el.createDiv({ text: "首页「实用工具」区域的外部链接", attr: { style: "color:var(--text-muted);font-size:17px;margin-bottom:8px;" } });
+		const toolsListEl = el.createDiv();
+		const renderToolsList = () => {
+			toolsListEl.empty();
+			s.customTools.forEach((tool, idx) => {
+				const row = toolsListEl.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:6px;align-items:center;" } });
+				const nameInp = row.createEl("input", { attr: { type: "text", value: tool.label, style: "width:120px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:17px;", placeholder: "名称" } });
+				nameInp.addEventListener("change", () => { s.customTools[idx]!.label = nameInp.value; void this.plugin.saveSettings(); });
+				const urlInp = row.createEl("input", { attr: { type: "text", value: tool.url, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:17px;", placeholder: "https://..." } });
+				urlInp.addEventListener("change", () => { s.customTools[idx]!.url = urlInp.value; void this.plugin.saveSettings(); });
+				const delBtn = row.createEl("button", { text: "✕", attr: { style: "padding:4px 7px;border-radius:3px;cursor:pointer;font-size:15px;border:none;background:var(--background-secondary);color:var(--text-muted);" } });
+				delBtn.addEventListener("click", () => { s.customTools.splice(idx, 1); void this.plugin.saveSettings(); renderToolsList(); });
+			});
+		};
+		renderToolsList();
+		const addToolBtn = el.createEl("button", { text: "+ 添加", attr: { style: "padding:4px 12px;border-radius:4px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);margin-top:4px;" } });
+		addToolBtn.addEventListener("click", () => { s.customTools.push({ label: "", url: "" }); void this.plugin.saveSettings(); renderToolsList(); });
 
 		section("数据管理");
 		const dataBtnRow = el.createDiv({ attr: { style: "display:flex;gap:8px;flex-wrap:wrap;" } });
@@ -1916,9 +2262,11 @@ class MainSidebarView extends ItemView {
 			const b = dataBtnRow.createEl("button", { text: label, attr: { style: "padding:5px 12px;border-radius:4px;cursor:pointer;font-size:18px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
 			b.addEventListener("click", cb);
 		};
-		dataBtn("重建知识点索引", () => { void (async () => { await this.plugin.migrateKnowledgeLinks(); new Notice("知识点索引已重建"); })(); });
+		dataBtn("重建知识点索引", () => { void (async () => { await this.plugin.rebuildKnowledgeIndex(); new Notice("知识点索引已重建"); })(); });
 		dataBtn("清除缓存", () => { this.plugin.invalidateCache(); new Notice("缓存已清除"); });
-		dataBtn("在Obsidian设置中打开", () => { (this.app as unknown as { setting?: { open(): void; scrollTop?(): void } }).setting?.open(); (this.app as unknown as { setting?: { open(): void; scrollTop?(): void } }).setting?.scrollTop?.(); });
+		el.createDiv({ text: "重建知识点索引：扫描题目/笔记/错题文件夹中的标签，重新生成知识点文件夹中的关联索引文件。手动修改标签后可点击。", attr: { style: "color:var(--text-muted);font-size:16px;margin-top:6px;line-height:1.5;" } });
+		el.createDiv({ text: "清除缓存：清空内存中的错题列表缓存，下次访问时重新从文件读取。一般无需手动操作。", attr: { style: "color:var(--text-muted);font-size:16px;margin-top:2px;line-height:1.5;" } });
+		window.requestAnimationFrame(() => { el.scrollTop = savedScrollTop; });
 	}
 
 	// ===================== FILE PICKER (inline) =====================
@@ -1929,7 +2277,7 @@ class MainSidebarView extends ItemView {
 
 		const backBtn = el.createEl("button", { text: "← 返回", attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);font-size:19px;margin-bottom:12px;" } });
 		backBtn.addEventListener("click", () => { this.homeView = "default"; void this.renderHomeTab(); });
-		el.createDiv({ text: "选择出题文档", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:8px;" } });
+		el.createDiv({ text: "选择题目文档", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:8px;" } });
 
 		const excludeList = this.buildExcludeList();
 		this.fpAllFiles = this.app.vault.getFiles().filter(f => {
@@ -2181,7 +2529,7 @@ class MainSidebarView extends ItemView {
 		void this.renderExamBrowser();
 
 		const cfg = this.plugin.settings;
-		const saveFolder = cfg.extractedExamFolder || "出题/识别试卷";
+		const saveFolder = cfg.extractedExamFolder || "题目/识别试卷";
 		await ensureFolder(this.app, saveFolder);
 		const savedPaths: string[] = [];
 		let totalQuestions = 0;
@@ -2196,20 +2544,37 @@ class MainSidebarView extends ItemView {
 				const content = await this.app.vault.read(file);
 				if (!content || content.trim().length === 0) continue;
 
-			if (content.length > MAX_EXAM_CONTENT_CHARS) {
-				this.examStatusText = "正在识别 (" + (i + 1) + "/" + files.length + ") " + file.name + "（内容较长，仅识别前" + MAX_EXAM_CONTENT_CHARS + "字符）...";
+				let allQuestionsText = "";
+				const chunks: string[] = [];
+				if (content.length <= MAX_EXAM_CHUNK_CHARS) {
+					chunks.push(content);
+				} else {
+					this.examStatusText = "正在识别 (" + (i + 1) + "/" + files.length + ") " + file.name + "（内容较长，分" + Math.ceil(content.length / MAX_EXAM_CHUNK_CHARS) + "段识别）...";
 					void this.renderExamBrowser();
+					const overlap = EXAM_CHUNK_OVERLAP;
+					for (let start = 0; start < content.length; start += MAX_EXAM_CHUNK_CHARS - overlap) {
+						chunks.push(content.slice(start, start + MAX_EXAM_CHUNK_CHARS));
+						if (start + MAX_EXAM_CHUNK_CHARS >= content.length) break;
+					}
 				}
 
-				const prompt = this.buildExamExtractPrompt(content);
-				const full = await this.callAIWithPrompt(prompt);
-				if (!full) continue;
+				for (let ci = 0; ci < chunks.length; ci++) {
+					const chunk = chunks[ci]!;
+					if (chunks.length > 1) {
+						this.examStatusText = "正在识别 (" + (i + 1) + "/" + files.length + ") " + file.name + " - 第" + (ci + 1) + "/" + chunks.length + "段...";
+						void this.renderExamBrowser();
+					}
+					const prompt = this.buildExamExtractPrompt(chunk, ci + 1, chunks.length);
+					const full = await this.callAIWithPrompt(prompt);
+					if (full) allQuestionsText += "\n\n" + full;
+				}
+				if (!allQuestionsText.trim()) continue;
 
-				const questions = parseQuestions(full);
+				const questions = parseQuestions(allQuestionsText);
 				if (questions.length === 0) continue;
 				totalQuestions += questions.length;
 
-				const { tags: aiTags, cleanText } = this.parseAITagsFromResult(full);
+				const { tags: aiTags, cleanText } = this.parseAITagsFromResult(allQuestionsText);
 				const saveContent = this.buildExamFrontmatter(file.basename, aiTags) + normalizeExamContent(cleanText);
 				const safeName = file.basename.replace(/[<>:"/\\|?*]/g, "_");
 				const savePath = saveFolder + "/" + safeName + " - AI识别.md";
@@ -2261,14 +2626,16 @@ class MainSidebarView extends ItemView {
 		this.startGenerate(normalizeExamContent(combined.trim()), savedPaths.length + "个识别试卷", paths.join(","));
 	}
 
-	buildExamExtractPrompt(content: string): string {
-		return `你是专业的试卷识别助手。请仔细阅读以下文档内容，精准识别并提取其中所有的考试题目。
+	buildExamExtractPrompt(content: string, chunkIndex?: number, totalChunks?: number): string {
+		const chunkHint = (chunkIndex && totalChunks && totalChunks > 1) ? "\n【重要】这是第" + chunkIndex + "/" + totalChunks + "段内容，请提取本段中所有题目，不要遗漏。" : "";
+		return `你是专业的试卷识别助手。请仔细阅读以下文档内容，精准识别并提取其中所有的考试题目。必须提取所有题目，不要遗漏任何一道题。
 
 【核心原则 - 必须遵守】
 1. 尊重原文：试卷上是什么题型，识别出来就是什么题型，不要改变题型
 2. 答案优先级：试卷上给了答案的，必须按试卷原样保留；试卷上没给答案的，由你根据题目内容生成规范的参考答案
 3. 题目完整性：完整保留题干、选项、分值等信息，不要删减
 4. 如果文档中有分值标注（如"每题2分"），保留该信息
+5. 全量提取：必须提取文档中出现的每一道题，不要只提取部分题目${chunkHint}
 
 【输出格式要求 - 必须严格遵守】
 必须按以下格式输出，否则系统无法解析：
@@ -2311,7 +2678,7 @@ D. 选项D文本
 - 题型分类标题必须准确反映原文题型（如原文是"论述题"就写"论述题"，不要统一改成"简答题"）
 
 ### 文档内容：
-${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
+${content}`;
 	}
 
 	async callAIWithPrompt(prompt: string): Promise<string> {
@@ -2369,6 +2736,148 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 		return "---\ntitle: \"" + sourceName + " - AI识别试卷\"\ndate: " + dateStr + "T" + timeStr + "\ntags:\n  - 试卷\n  - AI识别" + (tags.length > 0 ? "\n" + tags.map(t => "  - " + t).join("\n") : "") + "\nsourceType: ai-extracted\nsource: \"" + sourceName + "\"\n---\n\n";
 	}
 
+	// ===================== AI TAGGER (inline) =====================
+	async renderTaggerView() {
+		if (!this.innerContentEl) return;
+		const el = this.innerContentEl;
+		el.empty();
+
+		const backBtn = el.createEl("button", { text: "← 返回", attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);font-size:19px;margin-bottom:12px;" } });
+		backBtn.addEventListener("click", () => { this.fpSelected.clear(); this.taggerStatusText = ""; this.homeView = "default"; void this.renderHomeTab(); });
+		el.createDiv({ text: "AI添加标签", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:4px;" } });
+		el.createDiv({ text: "AI识别文档中的知识点，自动写入frontmatter，用于Obsidian知识图谱", attr: { style: "color:var(--text-muted);font-size:17px;margin-bottom:12px;" } });
+
+		const modeRow = el.createDiv({ attr: { style: "display:flex;gap:4px;margin-bottom:12px;" } });
+		const modes: { key: "current" | "folder"; label: string }[] = [
+			{ key: "current", label: "当前文件" },
+			{ key: "folder", label: "从文件夹选择" },
+		];
+		for (const m of modes) {
+			const btn = modeRow.createEl("button", { text: m.label, attr: { style: "padding:4px 12px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.taggerMode === m.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
+			btn.addEventListener("click", () => { this.taggerMode = m.key; this.fpSelected.clear(); void this.renderTaggerView(); });
+		}
+
+		if (this.taggerMode === "current") {
+			const activeFile = this.app.workspace.getActiveFile();
+			if (!activeFile || activeFile.extension !== "md") {
+				el.createDiv({ text: "请先打开一个Markdown文件", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:19px;" } });
+			} else {
+				const info = el.createDiv({ attr: { style: "padding:8px 10px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);margin-bottom:12px;font-size:17px;" } });
+				info.createSpan({ text: "当前文件：" });
+				info.createSpan({ text: activeFile.path, attr: { style: "color:var(--interactive-accent);" } });
+				const processBtn = el.createEl("button", { text: this.taggerProcessing ? "处理中..." : "🤖 开始识别标签", attr: { style: "padding:8px 20px;border-radius:4px;cursor:pointer;font-size:18px;border:1px solid var(--interactive-accent);background:var(--interactive-accent);color:var(--text-on-accent);" + (this.taggerProcessing ? "opacity:0.5;pointer-events:none;" : "") } });
+				processBtn.addEventListener("click", () => { void this.runAITagging([activeFile]); });
+			}
+		} else {
+			if (this.fpAllFiles.length === 0) {
+				const excludeList = this.buildExcludeList();
+				this.fpAllFiles = this.app.vault.getFiles().filter(f => {
+					if (f.extension !== "md") return false;
+					const lp = f.path.toLowerCase();
+					for (const ex of excludeList) { if (lp.includes(ex.toLowerCase() + "/") || lp.startsWith(ex.toLowerCase())) return false; }
+					return true;
+				});
+			}
+			const infoEl = el.createDiv({ attr: { style: "color:var(--text-muted);font-size:18px;margin-bottom:6px;" } });
+			infoEl.setText("共 " + this.fpAllFiles.length + " 个文档，已选 " + this.fpSelected.size + " 个");
+
+			const searchInput = el.createEl("input", { attr: { type: "text", placeholder: "搜索文件名...", style: "width:100%;padding:6px 8px;border-radius:4px;border:1px solid var(--background-modifier-border);margin-bottom:8px;" } });
+
+			const toolBar = el.createDiv({ attr: { style: "margin-bottom:8px;display:flex;gap:6px;" } });
+			const toolBtn = (label: string, cb: () => void) => {
+				const b = toolBar.createEl("button", { text: label, attr: { style: "padding:4px 10px;border-radius:4px;cursor:pointer;font-size:18px;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
+				b.addEventListener("click", cb);
+			};
+			toolBtn("全选", () => { this.fpAllFiles.forEach(f => this.fpSelected.add(f.path)); this.fpRenderTree(listEl, searchInput, infoEl); });
+			toolBtn("取消全选", () => { this.fpSelected.clear(); this.fpRenderTree(listEl, searchInput, infoEl); });
+
+			const listEl = el.createDiv({ attr: { style: "max-height:420px;overflow-y:auto;" } });
+			searchInput.addEventListener("input", debounce(() => this.fpRenderTree(listEl, searchInput, infoEl), SEARCH_DEBOUNCE_MS));
+			this.fpRenderTree(listEl, searchInput, infoEl);
+
+			const btnRow = el.createDiv({ attr: { style: "margin-top:12px;display:flex;gap:8px;" } });
+			const procBtn = btnRow.createEl("button", { text: (this.taggerProcessing ? "处理中..." : "🤖 开始识别标签（" + this.fpSelected.size + "个）"), attr: { style: "flex:1;padding:8px 16px;border-radius:4px;font-size:19px;cursor:pointer;border:1px solid var(--interactive-accent);background:var(--interactive-accent);color:var(--text-on-accent);" + (this.taggerProcessing || this.fpSelected.size === 0 ? "opacity:0.5;pointer-events:none;" : "") } });
+			procBtn.addEventListener("click", () => {
+				const files = this.fpAllFiles.filter(f => this.fpSelected.has(f.path));
+				void this.runAITagging(files);
+			});
+			const clearBtn = btnRow.createEl("button", { text: "清空选择", attr: { style: "padding:8px 16px;border-radius:4px;font-size:19px;cursor:pointer;border:1px solid var(--background-modifier-border);background:var(--background-secondary);color:var(--text-normal);" } });
+			clearBtn.addEventListener("click", () => { this.fpSelected.clear(); this.fpRenderTree(listEl, searchInput, infoEl); infoEl.setText("共 " + this.fpAllFiles.length + " 个文档，已选 0 个"); });
+		}
+
+		if (this.taggerStatusText) {
+			el.createDiv({ text: this.taggerStatusText, attr: { style: "margin-top:10px;padding:8px 10px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);font-size:17px;color:var(--text-muted);" } });
+		}
+	}
+
+	async runAITagging(files: TFile[]) {
+		if (files.length === 0 || this.taggerProcessing) return;
+		this.taggerProcessing = true;
+		this.taggerStatusText = "准备处理 " + files.length + " 个文件...";
+		void this.renderTaggerView();
+
+		const existingTags = await this.plugin.loadExistingKnowledgeTags();
+		const existingHint = existingTags.length > 0 ? "\n【已有知识点标签（请优先使用这些标签，也可以新增）】\n" + existingTags.join("、") + "\n" : "";
+
+		let successCount = 0;
+		let failCount = 0;
+
+		for (let i = 0; i < files.length; i++) {
+			const file = files[i]!;
+			this.taggerStatusText = "正在识别 (" + (i + 1) + "/" + files.length + ") " + file.basename + "...";
+			void this.renderTaggerView();
+
+			try {
+				const content = await this.app.vault.read(file);
+				if (!content || content.trim().length === 0) { failCount++; continue; }
+
+				const prompt = `你是专业的知识管理助手。请从以下文档中提取核心知识点标签。
+
+【任务】
+分析文档内容，提取3-8个最能概括文档核心主题的知识点标签。
+
+【标签规范】
+1. 必须是具体的知识点名称，不能笼统
+   ✓ 二项式定理、光合作用、TCP三次握手、法国大革命、牛顿第二定律
+   ✗ 数学、生物、计算机、历史、物理（太笼统，无法定位具体知识）
+2. 标签必须来自文档实际内容，不要凭空编造
+3. 优先使用已有标签（见下方列表），但可新增文档独有的知识点
+4. 每个标签2-8个字，不超过10个字
+5. 禁止使用"题目""笔记""错题""考试""试卷""选择题""简答题"等通用词
+6. 试卷/题目集 → 标签应反映考查的知识领域（如"概率论"而非"单选题"）
+7. 笔记/教材 → 标签应反映核心主题和关键概念
+
+【输出格式】
+每行一个标签，不编号，不解释，不输出其他内容。${existingHint}
+
+### 文档内容：
+${content.slice(0, 12000)}`;
+
+				const full = await this.callAIWithPrompt(prompt);
+				if (!full) { failCount++; continue; }
+
+				const tags = full.split("\n").map(s => s.replace(/^\d+[.、)\s]+/, "").replace(/^[-*]\s*/, "").trim()).filter(s => s.length >= 2 && s.length <= 15 && !/^(标签|知识点|tag)/i.test(s));
+				if (tags.length === 0) { failCount++; continue; }
+
+				const { meta, body } = parseFM(content);
+				const oldTags = Array.isArray(meta.tags) ? meta.tags : [];
+				const mergedTags = [...new Set([...oldTags, ...tags])];
+				const newFM = { ...meta, tags: mergedTags };
+				const newContent = buildFM(newFM) + body;
+				await this.app.vault.modify(file, newContent);
+				successCount++;
+			} catch (err) {
+				console.error("[question-generator] AI标签失败:", file.path, err);
+				failCount++;
+			}
+		}
+
+		this.taggerProcessing = false;
+		this.taggerStatusText = "完成！成功 " + successCount + " 个，失败 " + failCount + " 个";
+		void this.renderTaggerView();
+		new Notice("AI标签完成：成功 " + successCount + "，失败 " + failCount);
+	}
+
 	// ===================== GENERATE (inline) =====================
 	startGenerate(sourceText: string, name: string, sourcePath: string = "") {
 		this.genSourceText = sourceText;
@@ -2394,7 +2903,7 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 			return;
 		}
 
-		el.createDiv({ text: "出题设置", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:10px;" } });
+		el.createDiv({ text: "题目设置", attr: { style: "font-size:21px;font-weight:bold;margin-bottom:10px;" } });
 
 		const cleanedText = cleanSourceText(this.genSourceText);
 		const tokenEst = estimateTokens(cleanedText);
@@ -2403,7 +2912,7 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 		const infoEl = el.createDiv({ attr: { style: "padding:10px 14px;margin-bottom:14px;border-radius:8px;background:var(--background-secondary);font-size:18px;line-height:1.8;" } });
 		infoEl.createDiv({ text: "当前文档：" + this.genFileName, attr: { style: "font-weight:600;" } });
 		infoEl.createDiv({ text: "清洗后字符数：" + charCount.toLocaleString() + "　预估Token：" + tokenEst.toLocaleString(), attr: { style: "color:var(--text-muted);" } });
-		if (tokenEst > TOKEN_WARN_THRESHOLD) infoEl.createDiv({ text: "⚠️ 内容较长，建议分段出题", attr: { style: "color:var(--color-orange);margin-top:4px;" } });
+		if (tokenEst > TOKEN_WARN_THRESHOLD) infoEl.createDiv({ text: "⚠️ 内容较长，建议分段生成题目", attr: { style: "color:var(--color-orange);margin-top:4px;" } });
 
 		const cfg = this.plugin.settings;
 		const savedEnabled = cfg.lastEnabledTypes.split(",").filter(Boolean);
@@ -2414,17 +2923,23 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 			{ label: "填空题", key: "countBlank", count: cfg.countBlank, enabled: savedEnabled.length === 0 || savedEnabled.includes("blank") },
 			{ label: "简答题", key: "countEssay", count: cfg.countEssay, enabled: savedEnabled.length === 0 || savedEnabled.includes("essay") },
 		];
+		const activeTypes = types.filter(t => t.count > 0);
 
-		const toggleArea = el.createDiv({ attr: { style: "display:flex;flex-direction:column;gap:6px;margin-bottom:14px;" } });
-		for (const t of types) {
-			const row = toggleArea.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;border:1px solid var(--background-modifier-border);" } });
-			const cb = row.createEl("input", { attr: { type: "checkbox" } });
-			cb.checked = t.enabled;
-			row.createSpan({ text: t.label, attr: { style: "min-width:60px;font-size:18px;" } });
-			const countInput = row.createEl("input", { attr: { type: "number", min: "0", max: "50", value: String(t.count), style: "width:50px;padding:4px 6px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;font-size:18px;" } });
-			countInput.addEventListener("change", () => { t.count = parseInt(countInput.value) || 0; (cfg[t.key] as number) = t.count; });
-			row.createSpan({ text: "题", attr: { style: "font-size:17px;color:var(--text-muted);" } });
-			cb.addEventListener("change", () => { t.enabled = cb.checked; });
+		if (activeTypes.length === 1) {
+			const only = activeTypes[0]!;
+			el.createDiv({ text: "题型：" + only.label + " " + only.count + " 题", attr: { style: "font-size:18px;margin-bottom:14px;padding:8px 12px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);" } });
+		} else {
+			const toggleArea = el.createDiv({ attr: { style: "display:flex;flex-direction:column;gap:6px;margin-bottom:14px;" } });
+			for (const t of types) {
+				const row = toggleArea.createDiv({ attr: { style: "display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:6px;border:1px solid var(--background-modifier-border);" } });
+				const cb = row.createEl("input", { attr: { type: "checkbox" } });
+				cb.checked = t.enabled;
+				row.createSpan({ text: t.label, attr: { style: "min-width:60px;font-size:18px;" } });
+				const countInput = row.createEl("input", { attr: { type: "number", min: "0", max: "50", value: String(t.count), style: "width:50px;padding:4px 6px;border-radius:4px;border:1px solid var(--background-modifier-border);text-align:center;font-size:18px;" } });
+				countInput.addEventListener("change", () => { t.count = parseInt(countInput.value) || 0; (cfg[t.key] as number) = t.count; });
+				row.createSpan({ text: "题", attr: { style: "font-size:17px;color:var(--text-muted);" } });
+				cb.addEventListener("change", () => { t.enabled = cb.checked; });
+			}
 		}
 
 		el.createDiv({ text: "知识点标签（逗号分隔）：", attr: { style: "margin-bottom:4px;font-size:18px;" } });
@@ -2473,13 +2988,11 @@ ${content.slice(0, MAX_EXAM_CONTENT_CHARS)}`;
 		void this.genRunGenerate(update, typeStr, spinner, subText);
 	}
 
-	genBuildPrompt(typeStr: string): string {
-		const cfg = this.plugin.settings;
+	async genBuildPrompt(typeStr: string): Promise<string> {
 		const cleanSource = cleanSourceText(this.genSourceText);
-		const noMdRules = "\n\n【铁律 - 绝对禁止】\n1. 绝对不要使用任何Markdown格式\n2. 题号格式固定为：数字. 题干文本\n3. 选项格式固定为：A. 选项文本\n4. 答案行格式固定为：答案：A 或 答案：AB 或 答案：填写内容\n5. 解析行格式固定为：解析：解释文本\n6. 每道题之间必须空一行\n7. 不要在文末输出答案汇总\n8. 简答题答案必须用数字序号（1. 2. 3.）列出踩分点，每个序号单独一行\n9. 答案中多个要点（1. xxx 2. xxx 3. xxx）必须每个要点单独一行\n10. 在所有题目输出完毕后，最后一行必须输出：知识点：tag1, tag2, tag3（根据原文内容精准提取3-8个核心知识点，用逗号分隔）\n";
-		if (cfg.systemPrompt && cfg.systemPrompt.trim()) {
-			return cfg.systemPrompt + noMdRules + "\n### 参考原文：\n" + cleanSource + "\n出题数量：" + typeStr + "\n规则：无对应知识点直接跳过，不要虚构内容。";
-		}
+		const existingTags = await this.plugin.loadExistingKnowledgeTags();
+		const existingTagsHint = existingTags.length > 0 ? "\n【已有的知识点标签（请优先使用这些标签）】\n" + existingTags.join("、") + "\n" : "";
+		const noMdRules = "\n\n【铁律 - 绝对禁止】\n1. 绝对不要使用任何Markdown格式\n2. 题号格式固定为：数字. 题干文本\n3. 选项格式固定为：A. 选项文本\n4. 答案行格式固定为：答案：A 或 答案：AB 或 答案：填写内容\n5. 解析行格式固定为：解析：解释文本\n6. 每道题之间必须空一行\n7. 不要在文末输出答案汇总\n8. 简答题答案必须用数字序号（1. 2. 3.）列出踩分点，每个序号单独一行\n9. 答案中多个要点（1. xxx 2. xxx 3. xxx）必须每个要点单独一行\n10. 在所有题目输出完毕后，最后一行必须输出：知识点：tag1, tag2, tag3（根据已有知识点标签优先匹配，也可新增，3-8个，逗号分隔）\n";
 		return `你是专业出题教师，严格依据原文内容出题，禁止编造不存在知识点。
 
 【输出格式要求 - 必须严格遵守】
@@ -2520,16 +3033,17 @@ B. 错误
 答案：1. 第一个踩分点内容 2. 第二个踩分点内容 3. 第三个踩分点内容
 解析：解释文本
 ${noMdRules}
+${existingTagsHint}
 ### 参考原文：
 ${cleanSource}
 
-出题数量：${typeStr}
+题目数量：${typeStr}
 规则：无对应知识点直接跳过，不要虚构内容。
 【简答题答案格式要求】
 简答题答案必须使用数字序号（1. 2. 3.）列出踩分点，禁止使用"第一步""第二步"等文字描述。
 【知识点提取】
 在所有题目输出完毕后，最后一行必须输出：
-知识点：根据原文内容提取的核心知识点（3-8个，逗号分隔）`;
+知识点：根据已有知识点标签优先匹配，也可新增（3-8个，逗号分隔）`;
 	}
 
 	parseAITagsFromResult(text: string): { tags: string[]; cleanText: string } {
@@ -2550,7 +3064,7 @@ ${cleanSource}
 	async genRunGenerate(onChunk: (s: string) => void, typeStr: string, spinner: HTMLElement, subText: HTMLElement) {
 		if (this.genIsGenerating) { new Notice("正在生成中，请等待完成"); return; }
 		const cfg = this.plugin.settings;
-		const prompt = this.genBuildPrompt(typeStr);
+		const prompt = await this.genBuildPrompt(typeStr);
 		let full = "";
 		this.genIsGenerating = true;
 
@@ -2653,25 +3167,30 @@ ${cleanSource}
 	async genSaveToVault() {
 		if (!this.genResultText) { new Notice("还没有生成试题内容"); return; }
 		try {
-			await ensureFolder(this.app, this.plugin.settings.questionFolder);
+			await ensureFolder(this.app, this.plugin.rootPath(this.plugin.settings.questionFolder));
 			const dateStr = new Date().toISOString().slice(0, 10);
 			const autoTags = this.genAITags.length > 0 ? this.genAITags : extractKnowledgeTags(this.genFileName, this.genResultText);
 			const allTags = ["题目", ...this.genCurrentTags, ...autoTags.filter(t => !this.genCurrentTags.includes(t))];
 			const sourceLink = this.genFileName ? "[[" + this.genFileName + "]]" : "";
-			const fm = buildFM({ source: sourceLink, sourcePath: this.genSourcePath, date: dateStr, tags: allTags });
-			const content = fm + normalizeExamContent(this.genResultText);
+			const qIvls = parseReviewIntervals(this.plugin.settings.questionReviewIntervals, DEFAULT_QUESTION_INTERVALS);
+			const nextReviewDate = new Date(); nextReviewDate.setDate(nextReviewDate.getDate() + qIvls[0]!);
+			const fm = buildFM({ source: sourceLink, sourcePath: this.genSourcePath, date: dateStr, tags: allTags, nextReview: nextReviewDate.toISOString().slice(0, 10), interval: qIvls[0]!, correctCount: 0, wrongCount: 0 });
+			const kTags = knowledgeTags(allTags);
+			const knowledgeLinks = kTags.length > 0 ? "\n\n---\n\n**知识点：** " + kTags.map(t => "[[" + t + "]]").join(" ") + "\n" : "";
+			const content = fm + normalizeExamContent(this.genResultText) + knowledgeLinks;
 			const fileName = safeName(this.genFileName) + "_试题_" + dateStr + ".md";
-			if (isAbs(this.plugin.settings.questionFolder)) {
-				const filePath = this.plugin.settings.questionFolder + "\\" + fileName;
+			if (isAbs(this.plugin.rootPath(this.plugin.settings.questionFolder))) {
+				const filePath = this.plugin.rootPath(this.plugin.settings.questionFolder) + "\\" + fileName;
 				try { writeFileStr(filePath, content); }
-				catch { writeFileStr(this.plugin.settings.questionFolder + "\\" + safeName(this.genFileName) + "_试题_" + Date.now() + ".md", content); }
+				catch { writeFileStr(this.plugin.rootPath(this.plugin.settings.questionFolder) + "\\" + safeName(this.genFileName) + "_试题_" + Date.now() + ".md", content); }
 			} else {
-				const filePath = this.plugin.settings.questionFolder + "/" + fileName;
+				const filePath = this.plugin.rootPath(this.plugin.settings.questionFolder) + "/" + fileName;
 				try { await this.app.vault.create(filePath, content); }
-				catch { await this.app.vault.create(this.plugin.settings.questionFolder + "/" + safeName(this.genFileName) + "_试题_" + Date.now() + ".md", content); }
+				catch { await this.app.vault.create(this.plugin.rootPath(this.plugin.settings.questionFolder) + "/" + safeName(this.genFileName) + "_试题_" + Date.now() + ".md", content); }
 			}
-			new Notice("已保存到 " + this.plugin.settings.questionFolder);
+			new Notice("已保存到 " + this.plugin.rootPath(this.plugin.settings.questionFolder));
 			this.plugin.emitDataChanged();
+			void this.plugin.syncKnowledgeFolder(knowledgeTags(allTags), [{ label: fileName.replace(/\.md$/, ""), path: this.plugin.rootPath(this.plugin.settings.questionFolder) + "/" + fileName }], this.plugin.rootPath(this.plugin.settings.questionKnowledgeFolder));
 		} catch (err) { new Notice("保存失败：" + (err as Error).message); }
 	}
 
@@ -2730,21 +3249,20 @@ ${cleanSource}
 		const wp = await this.plugin.getWeakPoints();
 		if (wp.length === 0) { new Notice("暂无薄弱知识点数据"); return; }
 		const notes = await this.plugin.loadAllWrongNotes();
-		const unmastered = notes.filter(n => !n.mastered);
 		const sources: string[] = [];
 		const paths: string[] = [];
-		for (const note of unmastered) {
+		for (const note of notes) {
 			const srcName = note.sourceFile.replace(/\[\[|\]\]/g, "");
 			const src = this.app.vault.getFiles().find(f => f.basename === srcName || f.name === srcName);
 			if (src) { sources.push(await this.app.vault.read(src)); paths.push(src.path); }
-			else if (isAbs(this.plugin.settings.questionFolder)) {
-				const qDir = this.plugin.settings.questionFolder;
+			else if (isAbs(this.plugin.rootPath(this.plugin.settings.questionFolder))) {
+				const qDir = this.plugin.rootPath(this.plugin.settings.questionFolder);
 				if (fs.existsSync(qDir)) { for (const f of fs.readdirSync(qDir)) { if (f.includes(srcName) && f.endsWith(".md")) { sources.push(readFileStr(qDir + "\\" + f)); paths.push(qDir + "\\" + f); break; } } }
 			}
 		}
 		if (sources.length === 0) { new Notice("没有可用的源文件"); return; }
 		const weakPrompt = "【出题要求 - 请重点关注以下薄弱知识点】\n" + wp.map(w => "- " + w.tag + "（错题" + w.count + "次）").join("\n") + "\n\n对于上述薄弱知识点，每类至少出2-3题。\n\n";
-		this.startGenerate(weakPrompt + sources.join("\n\n---\n\n"), "薄弱点定向出题", paths.join(","));
+		this.startGenerate(weakPrompt + sources.join("\n\n---\n\n"), "薄弱点定向生成", paths.join(","));
 	}
 
 	// ===================== ANSWER (inline) =====================
@@ -2975,24 +3493,25 @@ ${cleanSource}
 		const tags = ["错题", ...this.answerCurrentTags];
 		const knowledgeLinks = buildKnowledgeLinks(tags);
 		try {
-			await ensureFolder(this.app, this.plugin.settings.wrongBookFolder);
+			await ensureFolder(this.app, this.plugin.rootPath(this.plugin.settings.wrongBookFolder));
 			const dateStr = new Date().toISOString().slice(0, 10);
 			const sourceLink = this.answerSourceName ? "[[" + this.answerSourceName + "]]" : "";
 			const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
-			const fm = buildFM({ source: sourceLink, sourcePath: this.answerSourcePath, date: dateStr, tags, mastered: false, note: noteText || "答题模式加入（" + wrongList.length + "题错误）", nextReview: tomorrow.toISOString().slice(0, 10), interval: 1, easeFactor: 2.5, reviewCount: 0 });
+			const fm = buildFM({ source: sourceLink, sourcePath: this.answerSourcePath, date: dateStr, tags, note: noteText || "答题模式加入（" + wrongList.length + "题错误）", nextReview: tomorrow.toISOString().slice(0, 10), interval: 1, correctCount: 0, wrongCount: wrongList.length });
 			const content = fm + wrongText + knowledgeLinks;
 			const fileName = safeName(this.answerSourceName) + "_错题_" + dateStr + ".md";
-			if (isAbs(this.plugin.settings.wrongBookFolder)) {
-				const dir = this.plugin.settings.wrongBookFolder;
+			if (isAbs(this.plugin.rootPath(this.plugin.settings.wrongBookFolder))) {
+				const dir = this.plugin.rootPath(this.plugin.settings.wrongBookFolder);
 				try { writeFileStr(dir + "\\" + fileName, content); }
 				catch { writeFileStr(dir + "\\" + safeName(this.answerSourceName) + "_错题_" + Date.now() + ".md", content); }
 			} else {
-				try { await this.app.vault.create(this.plugin.settings.wrongBookFolder + "/" + fileName, content); }
-				catch { await this.app.vault.create(this.plugin.settings.wrongBookFolder + "/" + safeName(this.answerSourceName) + "_错题_" + Date.now() + ".md", content); }
+				try { await this.app.vault.create(this.plugin.rootPath(this.plugin.settings.wrongBookFolder) + "/" + fileName, content); }
+				catch { await this.app.vault.create(this.plugin.rootPath(this.plugin.settings.wrongBookFolder) + "/" + safeName(this.answerSourceName) + "_错题_" + Date.now() + ".md", content); }
 			}
 			await this.plugin.updateKnowledgePointMOC(tags, fileName);
 			new Notice("已自动将 " + wrongList.length + " 道错题加入错题本");
 			this.plugin.emitDataChanged();
+			void this.plugin.syncKnowledgeFolder(knowledgeTags(tags), [{ label: fileName.replace(/\.md$/, ""), path: this.plugin.rootPath(this.plugin.settings.wrongBookFolder) + "/" + fileName }], this.plugin.rootPath(this.plugin.settings.wrongKnowledgeFolder));
 		} catch (err) { new Notice("加入错题本失败：" + (err as Error).message); console.error("[question-generator] 加入错题本失败:", err); }
 	}
 
@@ -3007,20 +3526,215 @@ ${cleanSource}
 	async getStats() {
 		const notes = await this.plugin.loadAllWrongNotes();
 		const dueCount = notes.filter(n => isDueForReview(n)).length;
-		const mastered = notes.filter(n => n.mastered).length;
 		const weakPoints = await this.plugin.getWeakPoints();
+		const qFolder = this.plugin.rootPath(this.plugin.settings.questionFolder);
+		const nFolder = this.plugin.rootPath(this.plugin.settings.noteViewFolder);
+		let questionCount = 0;
+		let noteCount = 0;
+		if (qFolder) {
+			if (isAbs(qFolder)) { try { if (fs.existsSync(qFolder)) questionCount = fs.readdirSync(qFolder).filter((f: string) => f.endsWith(".md")).length; } catch { /* */ } }
+			else { const tf = this.app.vault.getAbstractFileByPath(qFolder); if (tf instanceof TFolder) questionCount = tf.children.filter(f => f instanceof TFile && f.name.endsWith(".md")).length; }
+		}
+		if (nFolder) {
+			if (isAbs(nFolder)) { try { if (fs.existsSync(nFolder)) noteCount = fs.readdirSync(nFolder).filter((f: string) => f.endsWith(".md")).length; } catch { /* */ } }
+			else { const tf = this.app.vault.getAbstractFileByPath(nFolder); if (tf instanceof TFolder) noteCount = tf.children.filter(f => f instanceof TFile && f.name.endsWith(".md")).length; }
+		}
 		return {
 			dueCount,
 			totalWrong: notes.length,
-			mastered,
-			totalGenerated: this.plugin.history.length,
-			weakCount: weakPoints.length
+			weakCount: weakPoints.length,
+			questionCount,
+			noteCount,
 		};
 	}
 
 	async getDueNotes(): Promise<WrongAnswerNote[]> {
 		const notes = await this.plugin.loadAllWrongNotes();
 		return notes.filter(n => isDueForReview(n));
+	}
+}
+
+// ===================== OBSIDIAN SETTING TAB =====================
+class QuestionGeneratorSettingTab extends PluginSettingTab {
+	plugin: QuestionGeneratorPlugin;
+
+	constructor(app: App, plugin: QuestionGeneratorPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+		const s = this.plugin.settings;
+
+		new Setting(containerEl).setName("智学助手设置").setHeading();
+
+		// --- 文件夹 ---
+		new Setting(containerEl).setName("文件夹").setHeading();
+		containerEl.createDiv({ text: "根文件夹下包含所有模块子文件夹，修改后需重启插件生效", attr: { style: "color:var(--text-muted);font-size:14px;margin-bottom:8px;" } });
+
+		new Setting(containerEl)
+			.setName("根文件夹")
+			.setDesc("所有模块子文件夹的父目录")
+			.addText(cb => cb.setPlaceholder("智学助手").setValue(s.rootFolder).onChange(v => { s.rootFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("题目文件夹")
+			.addText(cb => cb.setValue(s.questionFolder).onChange(v => { s.questionFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("错题文件夹")
+			.addText(cb => cb.setValue(s.wrongBookFolder).onChange(v => { s.wrongBookFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("笔记文件夹")
+			.addText(cb => cb.setPlaceholder("笔记").setValue(s.noteViewFolder).onChange(v => { s.noteViewFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("AI识别文件夹")
+			.addText(cb => cb.setValue(s.extractedExamFolder).onChange(v => { s.extractedExamFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("排除文件夹")
+			.setDesc("逗号分隔的文件夹名，扫描时跳过")
+			.addText(cb => cb.setValue(s.excludeFolders).onChange(v => { s.excludeFolders = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("生成后自动保存到题库")
+			.addToggle(cb => cb.setValue(s.autoSave).onChange(v => { s.autoSave = v; void this.plugin.saveSettings(); }));
+
+		// --- 知识点文件夹 ---
+		new Setting(containerEl).setName("知识点文件夹").setHeading();
+		containerEl.createDiv({ text: "用于Obsidian图谱展示知识点关联，插件启动时自动创建", attr: { style: "color:var(--text-muted);font-size:14px;margin-bottom:8px;" } });
+
+		new Setting(containerEl)
+			.setName("题目知识点")
+			.addText(cb => cb.setPlaceholder("题目/知识点").setValue(s.questionKnowledgeFolder).onChange(v => { s.questionKnowledgeFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("笔记知识点")
+			.addText(cb => cb.setPlaceholder("笔记/知识点").setValue(s.noteKnowledgeFolder).onChange(v => { s.noteKnowledgeFolder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("错题知识点")
+			.addText(cb => cb.setPlaceholder("错题/知识点").setValue(s.wrongKnowledgeFolder).onChange(v => { s.wrongKnowledgeFolder = v; void this.plugin.saveSettings(); }));
+
+		// --- 默认题目数量 ---
+		new Setting(containerEl).setName("默认题目数量").setHeading();
+		const counts: { label: string; key: "countSingle" | "countMulti" | "countJudge" | "countBlank" | "countEssay" }[] = [
+			{ label: "单选题", key: "countSingle" },
+			{ label: "多选题", key: "countMulti" },
+			{ label: "判断题", key: "countJudge" },
+			{ label: "填空题", key: "countBlank" },
+			{ label: "简答题", key: "countEssay" },
+		];
+		for (const c of counts) {
+			new Setting(containerEl)
+				.setName(c.label)
+				.addText(cb => cb.setValue(String(s[c.key])).onChange(v => { s[c.key] = parseInt(v) || 0; void this.plugin.saveSettings(); }));
+		}
+
+		// --- API 配置 ---
+		new Setting(containerEl).setName("API 配置").setHeading();
+		new Setting(containerEl)
+			.setName("接口类型")
+			.addDropdown(cb => { cb.addOption("ollama", "Ollama").addOption("openai", "OpenAI兼容").setValue(s.apiType).onChange(v => { s.apiType = v as "ollama" | "openai"; void this.plugin.saveSettings(); }); });
+		new Setting(containerEl)
+			.setName("接口地址")
+			.addText(cb => cb.setValue(s.baseUrl).onChange(v => { s.baseUrl = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("模型名称")
+			.addText(cb => cb.setValue(s.modelName).onChange(v => { s.modelName = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("API key")
+			.addText(cb => cb.setValue(s.apiKey || "").onChange(v => { s.apiKey = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("Temperature")
+			.setDesc("控制输出随机性，0-2，越低越确定")
+			.addText(cb => cb.setValue(String(s.temperature)).onChange(v => { s.temperature = parseFloat(v) || 0.1; void this.plugin.saveSettings(); }));
+
+		// --- 复习间隔设置 ---
+		new Setting(containerEl).setName("复习间隔设置").setHeading();
+		containerEl.createDiv({ text: "参数越大复习间隔越长，记忆越牢固但可能遗忘；参数越小复习越频繁，短期效果好但耗时多。推荐使用默认值。", attr: { style: "color:var(--text-muted);font-size:14px;margin-bottom:10px;line-height:1.5;padding:8px;border-radius:6px;background:var(--background-secondary);border:1px solid var(--background-modifier-border);" } });
+
+		const intervalPresets: Record<string, { label: string; values: string; hint: string }[]> = {
+			wrong: [
+				{ label: "慢速", values: "2,5,10,20,40,60", hint: "首间隔2天，总周期约137天" },
+				{ label: "标准", values: "1,2,4,7,15,30", hint: "首间隔1天，总周期约59天" },
+				{ label: "快速", values: "1,1,2,3,5,7", hint: "首间隔1天，总周期约19天" },
+			],
+			question: [
+				{ label: "慢速", values: "14,30,60,90,120,180", hint: "首间隔14天，总周期约1.7年" },
+				{ label: "标准", values: "7,15,30,60,90", hint: "首间隔7天，总周期约207天" },
+				{ label: "快速", values: "3,5,10,15,30", hint: "首间隔3天，总周期约63天" },
+			],
+			note: [
+				{ label: "慢速", values: "3,7,14,30,60,90", hint: "首间隔3天，总周期约204天" },
+				{ label: "标准", values: "1,3,7,14,30", hint: "首间隔1天，总周期约55天" },
+				{ label: "快速", values: "1,1,2,3,5", hint: "首间隔1天，总周期约12天" },
+			],
+		};
+		const intervalConfigs: { label: string; key: "wrongReviewIntervals" | "questionReviewIntervals" | "noteReviewIntervals"; presetKey: string }[] = [
+			{ label: "错题复习间隔（天）", key: "wrongReviewIntervals", presetKey: "wrong" },
+			{ label: "题目复习间隔（天）", key: "questionReviewIntervals", presetKey: "question" },
+			{ label: "笔记复习间隔（天）", key: "noteReviewIntervals", presetKey: "note" },
+		];
+		for (const cfg of intervalConfigs) {
+			const presets = intervalPresets[cfg.presetKey]!;
+			const currentVal = s[cfg.key];
+			const currentPreset = presets.find(p => p.values === currentVal);
+			const activePreset = currentPreset || presets[1]!;
+			const setting = new Setting(containerEl)
+				.setName(cfg.label)
+				.setDesc(activePreset.hint + "。" + activePreset.range)
+				.addText(cb => cb.setValue(currentVal).setPlaceholder("1,2,4,7,15,30").onChange(v => { s[cfg.key] = v; void this.plugin.saveSettings(); }));
+			const btnDiv = setting.settingEl.createDiv({ attr: { style: "display:flex;gap:4px;margin-top:6px;" } });
+			for (const p of presets) {
+				const isActive = p.values === currentVal;
+				const btn = btnDiv.createEl("button", { text: p.label, attr: { style: "padding:2px 8px;border-radius:3px;cursor:pointer;font-size:13px;border:1px solid var(--background-modifier-border);background:" + (isActive ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-primary);color:var(--text-muted);") } });
+				btn.addEventListener("click", () => { s[cfg.key] = p.values; void this.plugin.saveSettings(); this.display(); });
+			}
+		}
+		new Setting(containerEl)
+			.setName("待复习默认排序")
+			.addDropdown(cb => { cb.addOption("default", "默认").addOption("source", "按源文件").addOption("tag", "按知识点").addOption("time", "按时间").setValue(s.sortReviewBy).onChange(v => { s.sortReviewBy = v as "default" | "source" | "tag" | "time"; void this.plugin.saveSettings(); }); });
+
+		// --- 学习设置 ---
+		new Setting(containerEl).setName("学习设置").setHeading();
+		new Setting(containerEl)
+			.setName("薄弱点阈值")
+			.setDesc("次以上错题标记为薄弱")
+			.addText(cb => cb.setValue(String(s.weakPointThreshold)).onChange(v => { s.weakPointThreshold = parseInt(v) || 2; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("启动时提醒复习")
+			.addToggle(cb => cb.setValue(s.autoReviewReminder).onChange(v => { s.autoReviewReminder = v; void this.plugin.saveSettings(); }));
+		new Setting(containerEl)
+			.setName("错题排序")
+			.addDropdown(cb => { cb.addOption("date", "按日期").addOption("tag", "按知识点").addOption("review", "按复习时间").setValue(s.sortWrongBy).onChange(v => { s.sortWrongBy = v as "date" | "tag" | "review"; void this.plugin.saveSettings(); }); });
+
+		// --- 实用工具 ---
+		new Setting(containerEl).setName("实用工具").setHeading();
+		containerEl.createDiv({ text: "首页「实用工具」区域的外部链接", attr: { style: "color:var(--text-muted);font-size:14px;margin-bottom:8px;" } });
+		const toolsContainer = containerEl.createDiv();
+		const renderTools = () => {
+			toolsContainer.empty();
+			s.customTools.forEach((tool, idx) => {
+				const row = toolsContainer.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:6px;align-items:center;" } });
+				const nameInp = row.createEl("input", { attr: { type: "text", value: tool.label, style: "width:120px;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);", placeholder: "名称" } });
+				nameInp.addEventListener("change", () => { s.customTools[idx]!.label = nameInp.value; void this.plugin.saveSettings(); });
+				const urlInp = row.createEl("input", { attr: { type: "text", value: tool.url, style: "flex:1;padding:5px;border-radius:4px;border:1px solid var(--background-modifier-border);", placeholder: "https://..." } });
+				urlInp.addEventListener("change", () => { s.customTools[idx]!.url = urlInp.value; void this.plugin.saveSettings(); });
+				const delBtn = row.createEl("button", { text: "✕", attr: { style: "padding:4px 7px;border-radius:3px;cursor:pointer;font-size:13px;border:none;background:var(--background-secondary);color:var(--text-muted);" } });
+				delBtn.addEventListener("click", () => { s.customTools.splice(idx, 1); void this.plugin.saveSettings(); renderTools(); });
+			});
+		};
+		renderTools();
+		new Setting(containerEl)
+			.addButton(cb => cb.setButtonText("+ 添加工具").onClick(() => { s.customTools.push({ label: "", url: "" }); void this.plugin.saveSettings(); renderTools(); }));
+
+		// --- 数据管理 ---
+		new Setting(containerEl).setName("数据管理").setHeading();
+		new Setting(containerEl)
+			.setName("重建知识点索引")
+			.setDesc("扫描题目/笔记/错题文件夹中的标签，重新生成知识点文件夹中的关联索引文件。手动修改标签后可点击。")
+			.addButton(cb => cb.setButtonText("重建").onClick(() => { void (async () => { await this.plugin.rebuildKnowledgeIndex(); new Notice("知识点索引已重建"); })(); }));
+		new Setting(containerEl)
+			.setName("清除缓存")
+			.setDesc("清空内存中的错题列表缓存，下次访问时重新从文件读取。一般无需手动操作。")
+			.addButton(cb => cb.setButtonText("清除").onClick(() => { this.plugin.invalidateCache(); new Notice("缓存已清除"); }));
 	}
 }
 
@@ -3033,6 +3747,12 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		const data = await this.loadData() as { history?: HistoryEntry[]; wrongAnswers?: { timestamp?: number; fileName?: string; note?: string; resultText?: string }[] } | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 		if (data?.history) this.history = data.history;
+	}
+	rootPath(subFolder: string): string {
+		const root = this.settings.rootFolder;
+		if (!root) return subFolder;
+		if (isAbs(subFolder)) return subFolder;
+		return root + "/" + subFolder;
 	}
 	async saveSettings() {
 		await this.saveData({ ...this.settings, history: this.history });
@@ -3048,13 +3768,13 @@ export default class QuestionGeneratorPlugin extends Plugin {
 	async migrateOldWrongAnswers() {
 		const data = await this.loadData() as { wrongAnswers?: { timestamp?: number; fileName?: string; note?: string; resultText?: string }[] } | null;
 		if (data?.wrongAnswers && data.wrongAnswers.length > 0) {
-			const folder = this.settings.wrongBookFolder;
+			const folder = this.rootPath(this.settings.wrongBookFolder);
 			await ensureFolder(this.app, folder);
 			let migrated = 0;
 			for (const old of data.wrongAnswers) {
 				const dateStr = old.timestamp ? new Date(old.timestamp).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
 				const tags = ["错题"];
-				const fm = buildFM({ source: old.fileName || "未知", date: dateStr, tags, mastered: false, note: old.note || "" });
+				const fm = buildFM({ source: old.fileName || "未知", date: dateStr, tags, note: old.note || "" });
 				const content = fm + (old.resultText || "");
 				const fileName = safeName(old.fileName || "未知") + "_错题_" + dateStr + "_" + migrated + ".md";
 				try {
@@ -3085,7 +3805,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 	async updateKnowledgePointMOC(tags: string[], noteFileName: string) {
 		const kp = knowledgeTags(tags);
 		if (kp.length === 0) return;
-		const mocFolder = this.settings.wrongBookFolder + "/知识点";
+		const mocFolder = this.rootPath(this.settings.wrongKnowledgeFolder);
 		await ensureFolder(this.app, mocFolder);
 		for (const tag of kp) {
 			const mocPath = mocFolder + "/" + safeName(tag) + ".md";
@@ -3106,8 +3826,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				while ((m = linkPattern.exec(body)) !== null) { if (!existingLinks.includes(m[1]!)) existingLinks.push(m[1]!); }
 			} catch { /* empty */ }
 			if (!existingLinks.includes(link.replace(/\[\[|\]\]/g, ""))) existingLinks.push(link.replace(/\[\[|\]\]/g, ""));
-			const relatedLinksYaml = existingLinks.map(l => "[[" + l.replace(/\[\[|\]\]/g, "") + "]]").join(", ");
-			const fm = buildFM({ tags: ["知识点", tag], relatedLinks: relatedLinksYaml, date: todayStr() });
+			const fm = buildFM({ tags: ["知识点", tag], relatedLinks: existingLinks, date: todayStr() });
 			let body = "# " + tag + "\n\n";
 			body += "> 知识点索引（MOC），由智学助手自动维护\n\n";
 			body += "## 相关错题\n\n";
@@ -3132,12 +3851,12 @@ export default class QuestionGeneratorPlugin extends Plugin {
 			return this._wrongNotesCache;
 		}
 		const notes: WrongAnswerNote[] = [];
-		const folder = this.settings.wrongBookFolder;
+		const folder = this.rootPath(this.settings.wrongBookFolder);
 		if (isAbs(folder)) {
 			ensureFolderAbs(folder);
 			for (const f of listMdFiles(folder)) {
 				const { meta, body } = parseFM(readFileStr(folder + "/" + f));
-				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
+				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 1 });
 			}
 		} else {
 			const folderFile = this.app.vault.getAbstractFileByPath(folder);
@@ -3145,7 +3864,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				for (const child of folderFile.children) {
 					if (child instanceof TFile && child.extension === "md") {
 						const { meta, body } = parseFM(await this.app.vault.read(child));
-						notes.push({ filePath: child.path, baseName: child.basename, date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], mastered: meta.mastered === true, resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, easeFactor: typeof meta.easeFactor === "number" ? meta.easeFactor : 2.5, reviewCount: typeof meta.reviewCount === "number" ? meta.reviewCount : 0 });
+						notes.push({ filePath: child.path, baseName: child.basename, date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 1 });
 					}
 				}
 			}
@@ -3153,6 +3872,179 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		this._wrongNotesCache = notes;
 		this._cacheTime = now;
 		return notes;
+	}
+
+	async loadAllQuestionFilesForReview(): Promise<WrongAnswerNote[]> {
+		const folder = this.rootPath(this.settings.questionFolder);
+		const notes: WrongAnswerNote[] = [];
+		if (isAbs(folder)) {
+			ensureFolderAbs(folder);
+			for (const f of listMdFiles(folder)) {
+				const { meta, body } = parseFM(readFileStr(folder + "/" + f));
+				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 0 });
+			}
+		} else {
+			const folderFile = this.app.vault.getAbstractFileByPath(folder);
+			if (folderFile instanceof TFolder) {
+				for (const child of folderFile.children) {
+					if (child instanceof TFile && child.extension === "md") {
+						const { meta, body } = parseFM(await this.app.vault.read(child));
+						notes.push({ filePath: child.path, baseName: child.basename, date: (meta.date as string) || "", sourceFile: (meta.source as string) || "", sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 0 });
+					}
+				}
+			}
+		}
+		return notes;
+	}
+
+	async loadAllVaultNotesForReview(): Promise<WrongAnswerNote[]> {
+		const folder = this.rootPath(this.settings.noteViewFolder);
+		const notes: WrongAnswerNote[] = [];
+		if (!folder) return notes;
+		if (isAbs(folder)) {
+			ensureFolderAbs(folder);
+			for (const f of listMdFiles(folder)) {
+				const { meta, body } = parseFM(readFileStr(folder + "/" + f));
+				notes.push({ filePath: folder + "/" + f, baseName: f.replace(/\.md$/, ""), date: (meta.date as string) || "", sourceFile: (meta.source as string) || f.replace(/\.md$/, ""), sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 0 });
+			}
+		} else {
+			const folderFile = this.app.vault.getAbstractFileByPath(folder);
+			if (folderFile instanceof TFolder) {
+				for (const child of folderFile.children) {
+					if (child instanceof TFile && child.extension === "md") {
+						const { meta, body } = parseFM(await this.app.vault.read(child));
+						notes.push({ filePath: child.path, baseName: child.basename, date: (meta.date as string) || "", sourceFile: (meta.source as string) || child.basename, sourcePath: (meta.sourcePath as string) || "", tags: Array.isArray(meta.tags) ? meta.tags : [], resultText: body, note: (meta.note as string) || "", nextReview: (meta.nextReview as string) || "", interval: typeof meta.interval === "number" ? meta.interval : 1, correctCount: typeof meta.correctCount === "number" ? meta.correctCount : 0, wrongCount: typeof meta.wrongCount === "number" ? meta.wrongCount : 0 });
+					}
+				}
+			}
+		}
+		return notes;
+	}
+
+	async loadExistingKnowledgeTags(): Promise<string[]> {
+		const folders = [this.rootPath(this.settings.questionKnowledgeFolder), this.rootPath(this.settings.noteKnowledgeFolder), this.rootPath(this.settings.wrongKnowledgeFolder)];
+		const tagSet = new Set<string>();
+		for (const folder of folders) {
+			if (!folder) continue;
+			if (isAbs(folder)) {
+				if (!fs.existsSync(folder)) continue;
+				for (const f of listMdFiles(folder)) {
+					tagSet.add(f.replace(/\.md$/, ""));
+				}
+			} else {
+				const folderFile = this.app.vault.getAbstractFileByPath(folder);
+				if (folderFile instanceof TFolder) {
+					for (const child of folderFile.children) {
+						if (child instanceof TFile && child.extension === "md") {
+							tagSet.add(child.basename);
+						}
+					}
+				}
+			}
+		}
+		return [...tagSet];
+	}
+
+	async syncKnowledgeFolder(tags: string[], links: { label: string; path: string }[], folderOverride?: string) {
+		const folder = folderOverride || this.rootPath(this.settings.wrongKnowledgeFolder);
+		if (!folder) return;
+		if (isAbs(folder)) {
+			if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
+			for (const tag of tags) {
+				const fp = folder + "\\" + tag + ".md";
+				const existingLinks: string[] = [];
+				if (fs.existsSync(fp)) {
+					const content = fs.readFileSync(fp, "utf-8");
+					const linkMatches = content.match(/\[\[([^\]]+)\]\]/g);
+					if (linkMatches) existingLinks.push(...linkMatches.map(l => l.replace(/\[\[|\]\]/g, "")));
+				}
+				const allLinks = [...new Set([...existingLinks, ...links.map(l => l.label)])].sort();
+				const body = `---\ntags: [知识点]\n---\n# ${tag}\n\n## 相关题目\n${allLinks.filter(l => l.includes("试题")).map(l => "-[[" + l + "]]").join("\n") || "暂无"}\n\n## 相关错题\n${allLinks.filter(l => !l.includes("试题")).map(l => "-[[" + l + "]]").join("\n") || "暂无"}\n`;
+				fs.writeFileSync(fp, body, "utf-8");
+			}
+		} else {
+			const folderObj = this.app.vault.getAbstractFileByPath(folder);
+			if (!folderObj || !(folderObj instanceof TFolder)) {
+				await this.app.vault.createFolder(folder).catch(() => {});
+			}
+			for (const tag of tags) {
+				const fp = folder + "/" + tag + ".md";
+				const existingFile = this.app.vault.getAbstractFileByPath(fp);
+				const existingLinks: string[] = [];
+				if (existingFile instanceof TFile) {
+					const content = await this.app.vault.read(existingFile);
+					const linkMatches = content.match(/\[\[([^\]]+)\]\]/g);
+					if (linkMatches) existingLinks.push(...linkMatches.map(l => l.replace(/\[\[|\]\]/g, "")));
+				}
+				const allLinks = [...new Set([...existingLinks, ...links.map(l => l.label)])].sort();
+				const body = `---\ntags: [知识点]\n---\n# ${tag}\n\n## 相关题目\n${allLinks.filter(l => l.includes("试题")).map(l => "-[[" + l + "]]").join("\n") || "暂无"}\n\n## 相关错题\n${allLinks.filter(l => !l.includes("试题")).map(l => "-[[" + l + "]]").join("\n") || "暂无"}\n`;
+				if (existingFile instanceof TFile) {
+					await this.app.vault.modify(existingFile, body);
+				} else {
+					await this.app.vault.create(fp, body);
+				}
+			}
+		}
+	}
+
+	async rebuildKnowledgeIndex() {
+		const tagMap: Record<string, { label: string; path: string }[]> = {};
+		const addLink = (tag: string, label: string, p: string) => {
+			const arr = tagMap[tag] || (tagMap[tag] = []);
+			if (!arr.some(l => l.label === label)) arr.push({ label, path: p });
+		};
+		const wrongNotes = await this.loadAllWrongNotes();
+		for (const n of wrongNotes) {
+			for (const t of knowledgeTags(n.tags)) addLink(t, n.baseName, n.filePath);
+		}
+		const extractTagsFromFile = async (file: TFile, folder: string) => {
+			try {
+				let content = "";
+				if (isAbs(folder)) { content = readFileStr(file.path); } else { content = await this.app.vault.read(file); }
+				const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+				if (fmMatch) {
+					const tagMatch = fmMatch[1]!.match(/tags:\s*\[([^\]]*)\]/);
+					if (tagMatch) {
+						const tags = tagMatch[1]!.split(",").map(s => s.trim()).filter(Boolean);
+						for (const t of knowledgeTags(tags)) addLink(t, file.basename, file.path);
+					}
+				}
+			} catch { /* skip */ }
+		};
+		const listMdFiles = (folder: string): TFile[] => {
+			if (isAbs(folder)) {
+				try {
+					if (!fs.existsSync(folder)) return [];
+					return fs.readdirSync(folder).filter((f: string) => f.endsWith(".md")).map((f: string) => {
+						const fp = path.join(folder, f);
+						const stat = fs.statSync(fp);
+						return { name: f, path: fp, basename: f.replace(/\.md$/, ""), stat: { mtime: stat.mtimeMs, size: stat.size } } as unknown as TFile;
+					});
+				} catch { return []; }
+			}
+			try {
+				const tfolder = this.app.vault.getAbstractFileByPath(folder);
+				if (!tfolder || !(tfolder instanceof TFolder)) return [];
+				return (tfolder.children as TFile[]).filter(f => f instanceof TFile && f.name.endsWith(".md"));
+			} catch { return []; }
+		};
+		const qFolder = this.rootPath(this.settings.questionFolder);
+		if (qFolder) {
+			for (const f of listMdFiles(qFolder)) await extractTagsFromFile(f, qFolder);
+		}
+		const nFolder = this.rootPath(this.settings.noteViewFolder);
+		if (nFolder) {
+			for (const f of listMdFiles(nFolder)) await extractTagsFromFile(f, nFolder);
+		}
+		const allTags = Object.keys(tagMap);
+		const knowledgeFolders = [this.rootPath(this.settings.questionKnowledgeFolder), this.rootPath(this.settings.noteKnowledgeFolder), this.rootPath(this.settings.wrongKnowledgeFolder)];
+		for (const kf of knowledgeFolders) {
+			if (!kf) continue;
+			if (allTags.length > 0) await this.syncKnowledgeFolder(allTags, [], kf);
+			for (const [tag, links] of Object.entries(tagMap)) {
+				await this.syncKnowledgeFolder([tag], links, kf);
+			}
+		}
 	}
 
 	async deleteWrongNote(filePath: string) {
@@ -3163,14 +4055,14 @@ export default class QuestionGeneratorPlugin extends Plugin {
 			if (file instanceof TFile) await this.app.fileManager.trashFile(file);
 		}
 		this.invalidateCache();
+		void this.rebuildKnowledgeIndex();
 	}
 
 	async getWeakPoints(): Promise<{ tag: string; count: number; questions: WrongAnswerNote[] }[]> {
 		const notes = await this.loadAllWrongNotes();
-		const unmastered = notes.filter(n => !n.mastered);
 		const threshold = this.settings.weakPointThreshold || 2;
 		const tagMap: Record<string, WrongAnswerNote[]> = {};
-		for (const n of unmastered) {
+		for (const n of notes) {
 			for (const t of knowledgeTags(n.tags)) {
 				if (!tagMap[t]) tagMap[t] = [];
 				tagMap[t].push(n);
@@ -3184,7 +4076,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 
 	async migrateKnowledgeLinks() {
 		const notes = await this.loadAllWrongNotes(true);
-		const mocFolder = this.settings.wrongBookFolder + "/知识点";
+		const mocFolder = this.rootPath(this.settings.wrongKnowledgeFolder);
 		await ensureFolder(this.app, mocFolder);
 		const allTagLinks: Record<string, string[]> = {};
 		let updated = 0;
@@ -3202,7 +4094,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 				continue;
 			}
 			const knowledgeLinkText = "\n\n**知识点：** " + kp.map(t => "[[" + t + "]]").join(" ") + "\n";
-			if (isAbs(this.settings.wrongBookFolder)) {
+			if (isAbs(this.rootPath(this.settings.wrongBookFolder))) {
 				const content = readFileStr(note.filePath);
 				writeFileStr(note.filePath, content + knowledgeLinkText);
 			} else {
@@ -3289,8 +4181,14 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		await this.loadSettings();
 
 		try {
-			await ensureFolder(this.app, this.settings.questionFolder);
-			await ensureFolder(this.app, this.settings.wrongBookFolder);
+			if (this.settings.rootFolder) await ensureFolder(this.app, this.settings.rootFolder);
+			await ensureFolder(this.app, this.rootPath(this.settings.questionFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.wrongBookFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.noteViewFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.extractedExamFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.questionKnowledgeFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.noteKnowledgeFolder));
+			await ensureFolder(this.app, this.rootPath(this.settings.wrongKnowledgeFolder));
 			await this.migrateOldWrongAnswers();
 			await this.migrateKnowledgeLinks();
 		} catch (err) {
@@ -3298,6 +4196,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		}
 
 		this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new MainSidebarView(leaf, this));
+		this.addSettingTab(new QuestionGeneratorSettingTab(this.app, this));
 
 		this.addRibbonIcon("pencil", "智学助手", async () => {
 			const leaves = this.app.workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE);
@@ -3341,7 +4240,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		this.addCommand({ id: "open-sidebar", name: "打开智学助手侧边栏", callback: async () => {
 			await this.activateSidebar();
 		}});
-		this.addCommand({ id: "view-history", name: "查看出题历史记录", callback: async () => {
+		this.addCommand({ id: "view-history", name: "查看题目生成历史记录", callback: async () => {
 			const view = await this.activateSidebar();
 			if (view) { view.activeSection = "wrong"; view.wrongView = "list"; await view.render(); }
 		}});
@@ -3365,7 +4264,7 @@ export default class QuestionGeneratorPlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
 			try {
 				if (file instanceof TFolder) {
-					menu.addItem(item => item.setTitle("选择文件出题").onClick(async () => {
+					menu.addItem(item => item.setTitle("选择文件生成题目").onClick(async () => {
 						const view = await this.activateSidebar();
 						if (view) { view.activeSection = "home"; view.homeView = "filePicker"; await view.render(); }
 					}));
