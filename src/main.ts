@@ -347,8 +347,8 @@ function parseReviewIntervals(s: string, fallback: number[]): number[] {
 export function reviewUpdate(correctCount: number, wasCorrect: boolean, intervals?: number[]): { correctCount: number; interval: number; nextReview: string } {
 	const ivls = intervals || DEFAULT_WRONG_INTERVALS;
 	let newCorrect = wasCorrect ? correctCount + 1 : 0;
-	const idx = Math.min(newCorrect, ivls.length - 1);
-	const newInterval = ivls[idx]!;
+	const idx = Math.min(newCorrect - 1, ivls.length - 1);
+	const newInterval = ivls[Math.max(idx, 0)]!;
 	const nextDate = new Date();
 	nextDate.setDate(nextDate.getDate() + newInterval);
 	return { correctCount: newCorrect, interval: newInterval, nextReview: nextDate.toISOString().slice(0, 10) };
@@ -1566,21 +1566,24 @@ class MainSidebarView extends ItemView {
 		const files = await this.listNoteViewFiles(folder);
 
 		const allTags = new Set<string>();
-		const fileData: { file: TFile; tags: string[] }[] = [];
+		const fileData: { file: TFile; tags: string[]; source: string }[] = [];
 		for (const file of files) {
 			try {
 				let content = "";
 				if (isAbs(folder)) { content = readFileStr(file.path); } else { content = await this.app.vault.read(file); }
 				const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
 				let tags: string[] = [];
+				let source = "";
 				if (fmMatch) {
 					const tagMatch = fmMatch[1]!.match(/tags:\s*\[([^\]]*)\]/);
 					if (tagMatch) tags = tagMatch[1]!.split(",").map(s => s.trim()).filter(Boolean);
+				const srcMatch = fmMatch[1]!.match(/source:\s*(.+)/);
+				if (srcMatch) source = srcMatch[1]!.trim().replace(/^"|"$/g, "").replace(/^\[\[|\]\]$/g, "");
 				}
 				const kp = knowledgeTags(tags);
 				kp.forEach(t => allTags.add(t));
-				fileData.push({ file, tags });
-			} catch { fileData.push({ file, tags: [] }); }
+				fileData.push({ file, tags, source });
+			} catch { fileData.push({ file, tags: [], source: "" }); }
 		}
 
 		const statsRow = el.createDiv({ attr: { style: "display:flex;gap:6px;margin-bottom:10px;font-size:18px;" } });
@@ -1614,9 +1617,9 @@ class MainSidebarView extends ItemView {
 		const renderList = (query: string) => {
 			listEl.empty();
 			const q = query.toLowerCase();
-			const filtered = q ? fileData.filter(fd => fd.file.name.toLowerCase().includes(q) || fd.file.basename.toLowerCase().includes(q)) : fileData;
+			const filtered = q ? fileData.filter(fd => fd.file.name.toLowerCase().includes(q) || fd.file.basename.toLowerCase().includes(q) || fd.source.toLowerCase().includes(q)) : fileData;
 
-			const renderFileItem = (container: HTMLElement, fd: { file: TFile; tags: string[] }) => {
+			const renderFileItem = (container: HTMLElement, fd: { file: TFile; tags: string[]; source: string }) => {
 				const file = fd.file;
 				const item = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:4px;padding:6px 4px;border-bottom:1px solid var(--background-modifier-border);font-size:18px;cursor:pointer;transition:background 0.15s;" } });
 				item.classList.add("qg-hover-bg");
@@ -1647,10 +1650,10 @@ class MainSidebarView extends ItemView {
 			if (this.notesSortMode === "default") {
 				for (const fd of filtered) renderFileItem(listEl, fd);
 			} else if (this.notesSortMode === "source") {
-				const groups: Record<string, { file: TFile; tags: string[] }[]> = {};
-				const noSource: { file: TFile; tags: string[] }[] = [];
+				const groups: Record<string, { file: TFile; tags: string[]; source: string }[]> = {};
+				const noSource: { file: TFile; tags: string[]; source: string }[] = [];
 				for (const fd of filtered) {
-					const src = fd.file.basename;
+					const src = fd.source || fd.file.basename;
 					if (!src) { noSource.push(fd); continue; }
 					const arr = groups[src] || (groups[src] = []);
 					arr.push(fd);
@@ -1672,8 +1675,8 @@ class MainSidebarView extends ItemView {
 					for (const fd of noSource) renderFileItem(listEl, fd);
 				}
 			} else if (this.notesSortMode === "tag") {
-				const tagGroups: Record<string, { file: TFile; tags: string[] }[]> = {};
-				const untagged: { file: TFile; tags: string[] }[] = [];
+				const tagGroups: Record<string, { file: TFile; tags: string[]; source: string }[]> = {};
+				const untagged: { file: TFile; tags: string[]; source: string }[] = [];
 				for (const fd of filtered) {
 					const kp = knowledgeTags(fd.tags);
 					if (kp.length === 0) { untagged.push(fd); continue; }
@@ -1748,15 +1751,22 @@ class MainSidebarView extends ItemView {
 				if (chosen.length === 0) { new Notice("请至少选择一个文件"); return; }
 				const noteFolder = this.plugin.rootPath(this.plugin.settings.noteViewFolder);
 				await ensureFolder(this.app, noteFolder);
+				const useFs = isAbs(noteFolder);
 				let count = 0;
 				for (const f of chosen) {
-					const content = await this.app.vault.read(f);
+					const content = useFs ? readFileStr(f.path) : await this.app.vault.read(f);
 					const dateStr = new Date().toISOString().slice(0, 10);
 					const fm = buildFM({ source: "[[" + f.basename + "]]", sourcePath: f.path, date: dateStr, tags: [] });
 					const noteFileName = safeName(f.basename) + "_笔记_" + dateStr + ".md";
-					const notePath = noteFolder + "/" + noteFileName;
-					try { await this.app.vault.create(notePath, fm + content); count++; }
-					catch { try { await this.app.vault.create(noteFolder + "/" + safeName(f.basename) + "_笔记_" + Date.now() + ".md", fm + content); count++; } catch { /* skip */ } }
+					if (useFs) {
+						const fp = noteFolder + "\\" + noteFileName;
+						try { writeFileStr(fp, fm + content); count++; }
+						catch { try { writeFileStr(noteFolder + "\\" + safeName(f.basename) + "_笔记_" + Date.now() + ".md", fm + content); count++; } catch { /* skip */ } }
+					} else {
+						const notePath = noteFolder + "/" + noteFileName;
+						try { await this.app.vault.create(notePath, fm + content); count++; }
+						catch { try { await this.app.vault.create(noteFolder + "/" + safeName(f.basename) + "_笔记_" + Date.now() + ".md", fm + content); count++; } catch { /* skip */ } }
+					}
 				}
 				new Notice("已创建 " + count + " 个笔记");
 				this.notePickerActive = false;
@@ -2117,8 +2127,9 @@ class MainSidebarView extends ItemView {
 			{ key: "question", label: "题目" },
 			{ key: "note", label: "笔记" },
 		];
+		const dueItems = allItems.filter(i => isDueForReview(i.note));
 		for (const opt of filterOpts) {
-			const count = opt.key === "all" ? allItems.length : allItems.filter(i => i.source === opt.key).length;
+			const count = opt.key === "all" ? dueItems.length : dueItems.filter(i => i.source === opt.key).length;
 			const btn = filterBar.createEl("button", { text: opt.label + " (" + count + ")", attr: { style: "padding:3px 8px;border-radius:3px;cursor:pointer;font-size:17px;border:1px solid var(--background-modifier-border);background:" + (this.reviewFilterType === opt.key ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-secondary);color:var(--text-muted);") } });
 			btn.addEventListener("click", () => { this.reviewFilterType = opt.key; void this.renderReviewTab(); });
 		}
@@ -2135,92 +2146,56 @@ class MainSidebarView extends ItemView {
 			btn.addEventListener("click", () => { this.reviewSortBy = opt.key; void this.renderReviewTab(); });
 		}
 
-		if (allItems.length === 0) {
-			el.createDiv({ text: "暂无待复习内容，开始答题积累数据吧！", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } });
+		if (dueItems.length === 0) {
+			el.createDiv({ text: "今日暂无待复习内容，继续学习积累吧！", attr: { style: "color:var(--text-muted);text-align:center;padding:30px 0;font-size:20px;" } });
 			return;
 		}
 
 		const today = todayStr();
-		const filteredItems = this.reviewFilterType === "all" ? allItems : allItems.filter(i => i.source === this.reviewFilterType);
-		const dueItems = filteredItems.filter(i => isDueForReview(i.note));
-		const upcomingItems = filteredItems.filter(i => i.note.nextReview && i.note.nextReview > today);
+		const filteredDue = this.reviewFilterType === "all" ? dueItems : dueItems.filter(i => i.source === this.reviewFilterType);
 
 		const sourceLabel: Record<string, string> = { wrong: "错题", question: "题目", note: "笔记" };
 		const sourceColor: Record<string, string> = { wrong: "var(--color-red)", question: "var(--interactive-accent)", note: "var(--color-green)" };
 
-		if (dueItems.length > 0) {
-			const banner = el.createDiv({ attr: { style: "padding:14px 16px;margin-bottom:14px;border-radius:8px;border:2px solid var(--interactive-accent);background:color-mix(in srgb, var(--interactive-accent) 8%, transparent);" } });
-			const bTop = banner.createDiv({ attr: { style: "display:flex;align-items:center;justify-content:space-between;" } });
-			bTop.createDiv({ text: "今日待复习", attr: { style: "font-size:20px;font-weight:700;color:var(--interactive-accent);" } });
-			bTop.createDiv({ text: dueItems.length + " 项", attr: { style: "font-size:26px;font-weight:bold;color:var(--interactive-accent);" } });
-			const parts: string[] = [];
-			const wDue = dueItems.filter(i => i.source === "wrong").length;
-			const qDue = dueItems.filter(i => i.source === "question").length;
-			const nDue = dueItems.filter(i => i.source === "note").length;
-			if (wDue > 0) parts.push("错题 " + wDue);
-			if (qDue > 0) parts.push("题目 " + qDue);
-			if (nDue > 0) parts.push("笔记 " + nDue);
-			if (parts.length > 0) banner.createDiv({ text: parts.join("　"), attr: { style: "font-size:17px;color:var(--text-muted);margin-top:4px;" } });
-		}
+		const banner = el.createDiv({ attr: { style: "padding:14px 16px;margin-bottom:14px;border-radius:8px;border:2px solid var(--interactive-accent);background:color-mix(in srgb, var(--interactive-accent) 8%, transparent);" } });
+		const bTop = banner.createDiv({ attr: { style: "display:flex;align-items:center;justify-content:space-between;" } });
+		bTop.createDiv({ text: "今日待复习", attr: { style: "font-size:20px;font-weight:700;color:var(--interactive-accent);" } });
+		bTop.createDiv({ text: dueItems.length + " 项", attr: { style: "font-size:26px;font-weight:bold;color:var(--interactive-accent);" } });
+		const parts: string[] = [];
+		const wDue = dueItems.filter(i => i.source === "wrong").length;
+		const qDue = dueItems.filter(i => i.source === "question").length;
+		const nDue = dueItems.filter(i => i.source === "note").length;
+		if (wDue > 0) parts.push("错题 " + wDue);
+		if (qDue > 0) parts.push("题目 " + qDue);
+		if (nDue > 0) parts.push("笔记 " + nDue);
+		if (parts.length > 0) banner.createDiv({ text: parts.join("　"), attr: { style: "font-size:17px;color:var(--text-muted);margin-top:4px;" } });
 
-		const sortedDue = [...dueItems];
-		const sortedUpcoming = [...upcomingItems];
+		const sortedDue = [...filteredDue];
 		if (this.reviewSortBy === "source") {
 			sortedDue.sort((a, b) => (a.note.sourceFile || a.note.baseName).localeCompare(b.note.sourceFile || b.note.baseName));
-			sortedUpcoming.sort((a, b) => (a.note.sourceFile || a.note.baseName).localeCompare(b.note.sourceFile || b.note.baseName));
 		} else if (this.reviewSortBy === "tag") {
 			sortedDue.sort((a, b) => (knowledgeTags(a.note.tags)[0] || "").localeCompare(knowledgeTags(b.note.tags)[0] || ""));
-			sortedUpcoming.sort((a, b) => (knowledgeTags(a.note.tags)[0] || "").localeCompare(knowledgeTags(b.note.tags)[0] || ""));
 		} else if (this.reviewSortBy === "time") {
 			sortedDue.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
-			sortedUpcoming.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
 		} else {
 			const priority: Record<string, number> = { wrong: 0, question: 1, note: 2 };
 			sortedDue.sort((a, b) => priority[a.source]! - priority[b.source]!);
-			sortedUpcoming.sort((a, b) => (a.note.nextReview || "").localeCompare(b.note.nextReview || ""));
 		}
 
-		if (sortedDue.length > 0) {
-			el.createDiv({ text: "到期复习", attr: { style: "font-size:18px;font-weight:600;color:var(--interactive-accent);margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-border);" } });
-			let lastGroup = "";
-			for (const item of sortedDue) {
-				const groupKey = this.reviewSortBy === "source" ? (item.note.sourceFile || item.note.baseName) : this.reviewSortBy === "tag" ? (knowledgeTags(item.note.tags)[0] || "无标签") : "";
-				if (this.reviewSortBy !== "default" && groupKey && groupKey !== lastGroup) {
-					if (lastGroup !== "") el.createDiv({ attr: { style: "height:6px;" } });
-					el.createDiv({ text: groupKey, attr: { style: "font-size:16px;font-weight:500;color:var(--text-faint);margin-bottom:4px;padding-left:4px;" } });
-					lastGroup = groupKey;
-				}
-				this.renderReviewRow(el, item, sourceLabel, sourceColor, daysUntil);
+		let lastGroup = "";
+		for (const item of sortedDue) {
+			const groupKey = this.reviewSortBy === "source" ? (item.note.sourceFile || item.note.baseName) : this.reviewSortBy === "tag" ? (knowledgeTags(item.note.tags)[0] || "无标签") : "";
+			if (this.reviewSortBy !== "default" && groupKey && groupKey !== lastGroup) {
+				if (lastGroup !== "") el.createDiv({ attr: { style: "height:6px;" } });
+				el.createDiv({ text: groupKey, attr: { style: "font-size:16px;font-weight:500;color:var(--text-faint);margin-bottom:4px;padding-left:4px;" } });
+				lastGroup = groupKey;
 			}
-		}
-
-		if (sortedUpcoming.length > 0) {
-			el.createDiv({ text: "即将复习", attr: { style: "font-size:18px;font-weight:600;color:var(--color-green);margin-top:14px;margin-bottom:6px;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-border);" } });
-			const grouped: Record<number, ReviewItem[]> = {};
-			for (const item of sortedUpcoming) {
-				const days = daysUntil(item.note.nextReview);
-				if (!grouped[days]) grouped[days] = [];
-				grouped[days].push(item);
-			}
-			const sortedDays = Object.keys(grouped).map(Number).sort((a, b) => a - b);
-			for (const days of sortedDays) {
-				const items = grouped[days]!;
-				const section = el.createDiv({ attr: { style: "margin-bottom:8px;" } });
-				const header = section.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;font-size:17px;color:var(--text-muted);cursor:pointer;" } });
-				const arrow = header.createSpan({ text: "▸" });
-				header.createSpan({ text: days + "天后复习（" + items.length + "项）" });
-				const body = section.createDiv({ attr: { style: "display:none;margin-top:4px;" } });
-				let expanded = false;
-				header.addEventListener("click", () => { expanded = !expanded; body.style.display = expanded ? "block" : "none"; arrow.setText(expanded ? "▾" : "▸"); });
-				for (const item of items) {
-					this.renderReviewRow(body, item, sourceLabel, sourceColor, daysUntil, true);
-				}
-			}
+			this.renderReviewRow(el, item, sourceLabel, sourceColor, daysUntil);
 		}
 	}
 
-	private renderReviewRow(container: HTMLElement, item: { note: WrongAnswerNote; source: string }, sourceLabel: Record<string, string>, sourceColor: Record<string, string>, daysUntil: (s: string) => number, compact = false) {
-		const row = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:" + (compact ? "4px 8px" : "6px 8px") + ";margin-bottom:4px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;transition:background 0.15s;" } });
+	private renderReviewRow(container: HTMLElement, item: { note: WrongAnswerNote; source: string }, sourceLabel: Record<string, string>, sourceColor: Record<string, string>, daysUntil: (s: string) => number) {
+		const row = container.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;padding:6px 8px;margin-bottom:4px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:18px;transition:background 0.15s;" } });
 		row.classList.add("qg-hover-bg");
 		row.createSpan({ text: sourceLabel[item.source] || item.source, attr: { style: "min-width:32px;font-size:13px;padding:1px 5px;border-radius:3px;background:" + (sourceColor[item.source] || "var(--text-muted)") + ";color:white;" } });
 		const nameText = (item.note.sourceFile || item.note.baseName).replace(/\[\[|\]\]/g, "");
@@ -2228,7 +2203,7 @@ class MainSidebarView extends ItemView {
 		const kp = knowledgeTags(item.note.tags);
 		if (kp.length > 0) row.createSpan({ text: "#" + kp[0], attr: { style: "font-size:16px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:80px;" } });
 		if (item.source === "wrong" && (item.note.wrongCount || 0) > 0) row.createSpan({ text: "错" + item.note.wrongCount + "次", attr: { style: "font-size:15px;color:var(--color-red);min-width:36px;text-align:right;" } });
-		if (!compact && item.note.nextReview) {
+		if (item.note.nextReview) {
 			const isOverdue = isDueForReview(item.note);
 			if (isOverdue) {
 				row.createSpan({ text: "已到期", attr: { style: "font-size:15px;color:var(--interactive-accent);font-weight:600;min-width:44px;text-align:right;" } });
@@ -2249,7 +2224,8 @@ class MainSidebarView extends ItemView {
 			: source === "question" ? parseReviewIntervals(this.plugin.settings.questionReviewIntervals, DEFAULT_QUESTION_INTERVALS)
 			: parseReviewIntervals(this.plugin.settings.noteReviewIntervals, DEFAULT_NOTE_INTERVALS);
 		const result = reviewUpdate(note.correctCount || 0, true, intervals);
-		if (isAbs(this.plugin.rootPath(this.plugin.settings.wrongBookFolder))) {
+		const useFs = isAbs(note.filePath);
+		if (useFs) {
 			const content = readFileStr(note.filePath);
 			const { meta, body } = parseFM(content);
 			meta.interval = result.interval;
@@ -2378,7 +2354,7 @@ class MainSidebarView extends ItemView {
 			for (const p of presets) {
 				const isActive = p.values === currentValue;
 				const btn = btnRow.createEl("button", { text: p.label, attr: { style: "padding:3px 10px;border-radius:3px;cursor:pointer;font-size:16px;border:1px solid var(--background-modifier-border);background:" + (isActive ? "var(--interactive-accent);color:var(--text-on-accent);" : "var(--background-primary);color:var(--text-muted);") } });
-				btn.addEventListener("click", () => { onChange(p.values); row.parentElement && this.renderSettingsTab(); });
+				btn.addEventListener("click", () => { onChange(p.values); void this.plugin.saveSettings(); row.parentElement && this.renderSettingsTab(); });
 			}
 			const activePreset = currentPreset || presets[1]!;
 			const tipRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:16px;color:var(--text-muted);" } });
@@ -2387,7 +2363,7 @@ class MainSidebarView extends ItemView {
 			const customRow = row.createDiv({ attr: { style: "display:flex;align-items:center;gap:6px;" } });
 			customRow.createSpan({ text: "自定义：", attr: { style: "font-size:16px;color:var(--text-muted);flex-shrink:0;" } });
 			const inp = customRow.createEl("input", { attr: { type: "text", value: currentValue, style: "flex:1;padding:4px 6px;border-radius:4px;border:1px solid var(--background-modifier-border);font-size:16px;font-family:monospace;", placeholder: "如 1,2,4,7,15,30" } });
-			inp.addEventListener("change", () => { onChange(inp.value); });
+			inp.addEventListener("change", () => { onChange(inp.value); void this.plugin.saveSettings(); });
 		};
 
 		renderIntervalRow("错题复习间隔（天）", s.wrongReviewIntervals, "wrong", v => { s.wrongReviewIntervals = v; });
@@ -3069,6 +3045,7 @@ ${content.slice(0, 12000)}`;
 		this.genResultText = "";
 		this.genCurrentTags = [];
 		this.genAITags = [];
+		if (this.activeSection !== "home") this.activeSection = "home";
 		this.homeView = "generate";
 		void this.renderHomeTab();
 	}
@@ -3457,6 +3434,7 @@ ${cleanSource}
 		this.answerAnswers = new Map();
 		this.answerWrongChecked = new Set();
 		this.answerStartTime = Date.now();
+		if (this.activeSection !== "home") this.activeSection = "home";
 		this.homeView = "answer";
 		void this.renderHomeTab();
 	}
@@ -3707,8 +3685,11 @@ ${cleanSource}
 	}
 
 	async getStats() {
-		const notes = await this.plugin.loadAllWrongNotes();
-		const dueCount = notes.filter(n => isDueForReview(n)).length;
+		const wrongNotes = await this.plugin.loadAllWrongNotes();
+		const questionFiles = await this.plugin.loadAllQuestionFilesForReview();
+		const vaultNotes = await this.plugin.loadAllVaultNotesForReview();
+		const allReviewItems = [...wrongNotes, ...questionFiles, ...vaultNotes];
+		const dueCount = allReviewItems.filter(n => isDueForReview(n)).length;
 		const weakPoints = await this.plugin.getWeakPoints();
 		const qFolder = this.plugin.rootPath(this.plugin.settings.questionFolder);
 		const nFolder = this.plugin.rootPath(this.plugin.settings.noteViewFolder);
@@ -3724,7 +3705,7 @@ ${cleanSource}
 		}
 		return {
 			dueCount,
-			totalWrong: notes.length,
+			totalWrong: wrongNotes.length,
 			weakCount: weakPoints.length,
 			questionCount,
 			noteCount,
@@ -3732,8 +3713,10 @@ ${cleanSource}
 	}
 
 	async getDueNotes(): Promise<WrongAnswerNote[]> {
-		const notes = await this.plugin.loadAllWrongNotes();
-		return notes.filter(n => isDueForReview(n));
+		const wrongNotes = await this.plugin.loadAllWrongNotes();
+		const questionFiles = await this.plugin.loadAllQuestionFilesForReview();
+		const vaultNotes = await this.plugin.loadAllVaultNotesForReview();
+		return [...wrongNotes, ...questionFiles, ...vaultNotes].filter(n => isDueForReview(n));
 	}
 }
 
